@@ -16,6 +16,7 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 // Kind selects the journal bucket and the work type a record describes.
@@ -131,25 +132,30 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("не удалось создать каталог журнала: %w", err)
 		}
 	}
+
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: lockTimeout})
 	if err != nil {
-		if errors.Is(err, bolt.ErrTimeout) {
+		if errors.Is(err, bolterrors.ErrTimeout) {
 			return nil, fmt.Errorf("%w: %s", errRecordBusy, path)
 		}
+
 		return nil, fmt.Errorf("не удалось открыть журнал %s: %w", path, err)
 	}
+
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range bucketNames {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("не удалось создать секцию журнала %q: %w", name, err)
 			}
 		}
+
 		return nil
 	})
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("не удалось подготовить журнал %s: %w", path, err)
 	}
+
 	return &Store{db: db}, nil
 }
 
@@ -158,6 +164,7 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+
 	return s.db.Close()
 }
 
@@ -199,10 +206,12 @@ func encodeRecord(r *Record) ([]byte, error) {
 		ErrMsg:            r.ErrMsg,
 		UpdatedAt:         r.UpdatedAt,
 	}
+
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(&body); err != nil {
 		return nil, fmt.Errorf("журнал: не удалось закодировать запись: %w", err)
 	}
+
 	return append([]byte{schemaVersion}, buf.Bytes()...), nil
 }
 
@@ -212,14 +221,17 @@ func decodeRecord(val []byte) (*Record, error) {
 	if len(val) == 0 {
 		return nil, errors.New("журнал: пустое значение записи")
 	}
+
 	version := val[0]
 	if version != schemaVersion {
 		return nil, fmt.Errorf("журнал: запись с неизвестной версией схемы %d (поддерживается %d); автоматическая миграция не поддерживается — используйте версию wauploader, записавшую этот журнал", version, schemaVersion)
 	}
+
 	var body recordBody
 	if err := gob.NewDecoder(bytes.NewReader(val[1:])).Decode(&body); err != nil {
 		return nil, fmt.Errorf("журнал: не удалось разобрать запись: %w", err)
 	}
+
 	return &Record{
 		Key:               KeyFor(body.Kind, body.Target),
 		Kind:              body.Kind,
@@ -246,14 +258,18 @@ func (s *Store) Put(r *Record) error {
 	if err := validateKind(r.Kind); err != nil {
 		return err
 	}
+
 	if err := validateState(r.State); err != nil {
 		return err
 	}
+
 	stored := *r
+
 	stored.Key = KeyFor(stored.Kind, stored.Target)
 	if stored.UpdatedAt.IsZero() {
 		stored.UpdatedAt = time.Now()
 	}
+
 	stored.SchemaVersion = schemaVersion
 
 	return s.db.Update(func(tx *bolt.Tx) error {
@@ -261,10 +277,12 @@ func (s *Store) Put(r *Record) error {
 		if b == nil {
 			return fmt.Errorf("журнал: отсутствует бакет %q", stored.Kind)
 		}
+
 		encoded, err := encodeRecord(&stored)
 		if err != nil {
 			return err
 		}
+
 		return b.Put([]byte(stored.Key), encoded)
 	})
 }
@@ -275,30 +293,37 @@ func (s *Store) Get(kind Kind, target string) (*Record, bool, error) {
 	if err := validateKind(kind); err != nil {
 		return nil, false, err
 	}
+
 	var (
 		rec   *Record
 		found bool
 	)
+
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNames[kind])
 		if b == nil {
 			return fmt.Errorf("журнал: отсутствует бакет %q", kind)
 		}
+
 		val := b.Get([]byte(KeyFor(kind, target)))
 		if val == nil {
 			return nil
 		}
+
 		decoded, err := decodeRecord(val)
 		if err != nil {
 			return err
 		}
+
 		rec = decoded
 		found = true
+
 		return nil
 	})
 	if err != nil {
 		return nil, false, err
 	}
+
 	return rec, found, nil
 }
 
@@ -310,23 +335,29 @@ func (s *Store) UpdateState(kind Kind, target string, st State, mutate func(*Rec
 	if err := validateKind(kind); err != nil {
 		return err
 	}
+
 	if err := validateState(st); err != nil {
 		return err
 	}
+
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNames[kind])
 		if b == nil {
 			return fmt.Errorf("журнал: отсутствует бакет %q", kind)
 		}
+
 		key := []byte(KeyFor(kind, target))
+
 		val := b.Get(key)
 		if val == nil {
 			return fmt.Errorf("запись не найдена в журнале (тип %s): %s", kind, target)
 		}
+
 		rec, err := decodeRecord(val)
 		if err != nil {
 			return err
 		}
+
 		rec.State = st
 		if mutate != nil {
 			mutate(rec)
@@ -336,29 +367,31 @@ func (s *Store) UpdateState(kind Kind, target string, st State, mutate func(*Rec
 		if err := validateState(rec.State); err != nil {
 			return err
 		}
+
 		if err := validateKind(rec.Kind); err != nil {
 			return err
 		}
+
 		if rec.Kind != kind {
 			return fmt.Errorf("изменение типа записи запрещено (тип %s): %s", kind, target)
 		}
+
 		if rec.Key != string(key) {
 			return fmt.Errorf("изменение ключа записи запрещено: %s", target)
 		}
+
 		rec.UpdatedAt = time.Now()
 		rec.SchemaVersion = schemaVersion
+
 		encoded, err := encodeRecord(rec)
 		if err != nil {
 			return err
 		}
+
 		return b.Put(key, encoded)
 	})
 }
 
-// ByStates scans the given kinds' buckets and returns records whose state is
-// in states — the resume scan. A nil/empty kinds list means both kinds; a
-// nil/empty states list means all states. Records come back as copies, safe
-// outside the transaction.
 // Delete removes the record stored for kind+target and reports whether a
 // record existed. Added for the `jobs --clear` surface (Task 12): no other
 // mutation surface changed.
@@ -366,70 +399,91 @@ func (s *Store) Delete(kind Kind, target string) (bool, error) {
 	if err := validateKind(kind); err != nil {
 		return false, err
 	}
+
 	key := KeyFor(kind, target)
+
 	var existed bool
+
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNames[kind])
 		if b == nil {
 			return fmt.Errorf("секция журнала %q отсутствует", bucketNames[kind])
 		}
+
 		existed = b.Get([]byte(key)) != nil
+
 		return b.Delete([]byte(key))
 	})
 	if err != nil {
 		return false, err
 	}
+
 	return existed, nil
 }
 
+// ByStates scans the given kinds' buckets and returns records whose state is
+// in states — the resume scan. A nil/empty kinds list means both kinds; a
+// nil/empty states list means all states. Records come back as copies, safe
+// outside the transaction.
 func (s *Store) ByStates(kinds []Kind, states []State) ([]Record, error) {
 	kindList, err := resolveKinds(kinds)
 	if err != nil {
 		return nil, err
 	}
+
 	stateFilter := make(map[State]bool, len(states))
 	for _, st := range states {
 		if !allStates[st] {
 			return nil, fmt.Errorf("неизвестное состояние %q", string(st))
 		}
+
 		stateFilter[st] = true
 	}
+
 	matchState := func(st State) bool {
 		if len(stateFilter) == 0 {
 			return true
 		}
+
 		return stateFilter[st]
 	}
 
 	var out []Record
+
 	err = s.db.View(func(tx *bolt.Tx) error {
 		for _, kind := range kindList {
 			b := tx.Bucket(bucketNames[kind])
 			if b == nil {
 				continue
 			}
+
 			err := b.ForEach(func(_, val []byte) error {
 				if val == nil {
 					return nil
 				}
+
 				rec, err := decodeRecord(val)
 				if err != nil {
 					return err
 				}
+
 				if matchState(rec.State) {
 					out = append(out, *rec)
 				}
+
 				return nil
 			})
 			if err != nil {
 				return err
 			}
 		}
+
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
 	return out, nil
 }
 
@@ -439,35 +493,43 @@ func (s *Store) Counts() (map[Kind]map[State]int, error) {
 		KindSave:   {},
 		KindUpload: {},
 	}
+
 	err := s.db.View(func(tx *bolt.Tx) error {
 		for _, name := range bucketNames {
 			b := tx.Bucket(name)
 			if b == nil {
 				continue
 			}
+
 			err := b.ForEach(func(_, val []byte) error {
 				if val == nil {
 					return nil
 				}
+
 				rec, err := decodeRecord(val)
 				if err != nil {
 					return err
 				}
+
 				if counts[rec.Kind] == nil {
 					counts[rec.Kind] = map[State]int{}
 				}
+
 				counts[rec.Kind][rec.State]++
+
 				return nil
 			})
 			if err != nil {
 				return err
 			}
 		}
+
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
 	return counts, nil
 }
 
@@ -476,6 +538,7 @@ func validateKind(kind Kind) error {
 	if _, ok := bucketNames[kind]; !ok {
 		return fmt.Errorf("неизвестный тип записи %q (допустимо: save, upload)", string(kind))
 	}
+
 	return nil
 }
 
@@ -484,6 +547,7 @@ func validateState(st State) error {
 	if !allStates[st] {
 		return fmt.Errorf("неизвестное состояние %q", string(st))
 	}
+
 	return nil
 }
 
@@ -492,12 +556,15 @@ func resolveKinds(kinds []Kind) ([]Kind, error) {
 	if len(kinds) == 0 {
 		return []Kind{KindSave, KindUpload}, nil
 	}
+
 	out := make([]Kind, 0, len(kinds))
 	for _, kind := range kinds {
 		if err := validateKind(kind); err != nil {
 			return nil, err
 		}
+
 		out = append(out, kind)
 	}
+
 	return out, nil
 }

@@ -159,18 +159,23 @@ func Load(path string) (*Config, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return Default(), nil
 		}
+
 		return nil, fmt.Errorf("не удалось прочитать файл конфигурации %s: %w", path, err)
 	}
+
 	cfg := Default()
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		var decodeErr *toml.DecodeError
 		if errors.As(err, &decodeErr) {
 			row, col := decodeErr.Position()
+
 			return nil, fmt.Errorf("не удалось разобрать файл конфигурации %s (строка %d, столбец %d): %w\n%s",
 				path, row, col, decodeErr, decodeErr.String())
 		}
+
 		return nil, fmt.Errorf("не удалось разобрать файл конфигурации %s: %w", path, err)
 	}
+
 	return cfg, nil
 }
 
@@ -183,31 +188,39 @@ func DetectUnknownKeys(path string) ([]string, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
+
 		return nil, fmt.Errorf("не удалось прочитать файл конфигурации %s: %w", path, err)
 	}
+
 	var tree map[string]any
 	if err := toml.Unmarshal(data, &tree); err != nil {
 		return nil, fmt.Errorf("не удалось разобрать файл конфигурации %s: %w", path, err)
 	}
+
 	var unknown []string
+
 	for section, fields := range tree {
 		keys, known := knownSections[section]
 		if !known {
 			unknown = append(unknown, section)
 			continue
 		}
+
 		sub, isTable := fields.(map[string]any)
 		if !isTable {
 			unknown = append(unknown, section)
 			continue
 		}
+
 		for key := range sub {
 			if !keys[key] {
 				unknown = append(unknown, section+"."+key)
 			}
 		}
 	}
+
 	sort.Strings(unknown)
+
 	return unknown, nil
 }
 
@@ -221,10 +234,12 @@ const maxIATimedeltaSeconds int64 = 100 * 365 * 24 * 3600
 // totals beyond 100 years are rejected.
 func ParseIATimedelta(s string) (time.Duration, error) {
 	const usage = `примеры допустимых форм "120" (секунды) и "3d 5h 20m" (единицы d, h, m, s)`
+
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
 		return 0, fmt.Errorf("пустое значение длительности: %s", usage)
 	}
+
 	badFormat := func() error {
 		return fmt.Errorf("недопустимое значение длительности %q: %s", s, usage)
 	}
@@ -241,14 +256,19 @@ func ParseIATimedelta(s string) (time.Duration, error) {
 		case seconds > maxIATimedeltaSeconds:
 			return 0, overLimit()
 		}
+
 		return time.Duration(seconds) * time.Second, nil
 	}
+
 	var total int64
+
 	for _, token := range strings.Fields(trimmed) {
 		if len(token) < 2 {
 			return 0, badFormat()
 		}
+
 		var unitSeconds int64
+
 		switch token[len(token)-1] {
 		case 'd':
 			unitSeconds = 86400
@@ -261,6 +281,7 @@ func ParseIATimedelta(s string) (time.Duration, error) {
 		default:
 			return 0, badFormat()
 		}
+
 		value, err := strconv.ParseInt(token[:len(token)-1], 10, 64)
 		if err != nil || value < 0 {
 			return 0, badFormat()
@@ -269,11 +290,13 @@ func ParseIATimedelta(s string) (time.Duration, error) {
 		if value > maxIATimedeltaSeconds/unitSeconds {
 			return 0, overLimit()
 		}
+
 		total += value * unitSeconds
 		if total > maxIATimedeltaSeconds {
 			return 0, overLimit()
 		}
 	}
+
 	return time.Duration(total) * time.Second, nil
 }
 
@@ -290,6 +313,7 @@ func (c *Config) Validate(mode Mode) error {
 	if (c.Auth.S3Access == "") != (c.Auth.S3Secret == "") {
 		return errors.New("s3_access и s3_secret должны быть заданы вместе (оба ключа или ни одного — тогда используются куки)")
 	}
+
 	switch c.SPN2.AuthMode {
 	case "auto", "keys", "cookies":
 	default:
@@ -303,33 +327,40 @@ func (c *Config) Validate(mode Mode) error {
 				return fmt.Errorf("недопустимое значение if_not_archived_within: %w", err)
 			}
 		}
+
 		if c.SPN2.JSBehaviorTimeout < 0 || c.SPN2.JSBehaviorTimeout > 30 {
 			return fmt.Errorf("js_behavior_timeout должен быть от 0 до 30 секунд, сейчас %d", c.SPN2.JSBehaviorTimeout)
 		}
 	}
 
 	uploads := mode == ModeUpload || mode == ModeAny
-	if uploads {
+	if uploads { //nolint:nestif // fail-fast validation ladder: each nested rule names its own Russian error
 		if _, err := ParseIATimedelta(c.Limits.JobWait); err != nil {
 			return fmt.Errorf("недопустимое значение job_wait: %w", err)
 		}
+
 		if c.Upload.Collection == "" {
 			return errors.New("не задан обязательный параметр --collection: загружаемые элементы должны принадлежать коллекции archive.org")
 		}
+
 		allowed := strings.Join(mediatypeValues, ", ")
 		if c.Upload.Mediatype == "" {
 			return fmt.Errorf("не задан обязательный параметр mediatype: допустимые значения %s", allowed)
 		}
+
 		valid := false
+
 		for _, mt := range mediatypeValues {
 			if c.Upload.Mediatype == mt {
 				valid = true
 				break
 			}
 		}
+
 		if !valid {
 			return fmt.Errorf("недопустимое значение mediatype %q: допустимые значения %s", c.Upload.Mediatype, allowed)
 		}
 	}
+
 	return nil
 }

@@ -43,7 +43,9 @@ func NewVersionCommand(jsonOut *bool) *cobra.Command {
 			if jsonOut != nil && *jsonOut {
 				return json.NewEncoder(w).Encode(versionPayload{Name: Name, Version: Version})
 			}
+
 			_, err := fmt.Fprintf(w, "%s version %s\n", Name, Version)
+
 			return err
 		},
 	}

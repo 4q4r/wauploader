@@ -64,12 +64,15 @@ func (o RetryOpts) normalize() RetryOpts {
 	if o.MaxAttempts <= 0 {
 		o.MaxAttempts = 5
 	}
+
 	if o.BaseWait <= 0 {
 		o.BaseWait = time.Second
 	}
+
 	if o.MaxWait <= 0 {
 		o.MaxWait = 60 * time.Second
 	}
+
 	return o
 }
 
@@ -98,11 +101,13 @@ var (
 //   - RetryNone performs exactly one attempt and returns whatever the
 //     server answered, including non-2xx responses with live bodies
 //     (SPN2 envelope parsing depends on this).
-func (c *Client) DoWithRetry(ctx context.Context, req *http.Request, o RetryOpts) (*http.Response, error) {
+func (c *Client) DoWithRetry(ctx context.Context, req *http.Request, o RetryOpts) (*http.Response, error) { //nolint:gocognit // retry ladder: branches map 1:1 onto wire outcomes; 31 vs cap 30
 	o = o.normalize()
+
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrContextDeadline, err)
 	}
+
 	if o.Mode == RetryIdempotent && req.Body != nil && req.GetBody == nil {
 		return nil, errors.New("httpx: RetryIdempotent requires a replayable body " +
 			"(http.NewRequest sets GetBody for bytes/string readers); set req.GetBody, " +
@@ -111,7 +116,7 @@ func (c *Client) DoWithRetry(ctx context.Context, req *http.Request, o RetryOpts
 
 	for attempt := 1; attempt <= o.MaxAttempts; attempt++ {
 		resp, err := c.HTTP.Do(req)
-		if err == nil {
+		if err == nil { //nolint:nestif // retry ladder: outcome branches read top-to-bottom like the wire
 			if !retryableStatus(o.Mode, resp.StatusCode) {
 				return resp, nil
 			}
@@ -120,34 +125,43 @@ func (c *Client) DoWithRetry(ctx context.Context, req *http.Request, o RetryOpts
 			wait := retryAfterWait(resp.Header, o.MaxWait)
 			status := resp.StatusCode
 			drainAndClose(resp)
+
 			if attempt == o.MaxAttempts {
 				return nil, fmt.Errorf("%w after %d attempts: last HTTP status %d (%s)",
 					ErrRetryBudgetExceeded, attempt, status, http.StatusText(status))
 			}
+
 			if wait == 0 {
 				wait = backoff(o.BaseWait, o.MaxWait, attempt)
 			}
+
 			if !sleepCtx(ctx, wait) {
 				return nil, fmt.Errorf("%w: %w", ErrContextDeadline, ctx.Err())
 			}
+
 			if err := rewindBody(req); err != nil {
 				return nil, err
 			}
+
 			continue
 		}
 
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("%w: %w: %w", ErrContextDeadline, ctx.Err(), err)
 		}
+
 		if !retryableTransport(o.Mode, err) {
 			return nil, err
 		}
+
 		if attempt == o.MaxAttempts {
 			return nil, fmt.Errorf("%w after %d attempts: %w", ErrRetryBudgetExceeded, attempt, err)
 		}
+
 		if !sleepCtx(ctx, backoff(o.BaseWait, o.MaxWait, attempt)) {
 			return nil, fmt.Errorf("%w: %w", ErrContextDeadline, ctx.Err())
 		}
+
 		if err := rewindBody(req); err != nil {
 			return nil, err
 		}
@@ -164,6 +178,7 @@ func retryableStatus(mode RetryMode, code int) bool {
 	if mode != RetryIdempotent {
 		return false
 	}
+
 	return code == http.StatusTooManyRequests ||
 		(code >= http.StatusInternalServerError && code != http.StatusNotImplemented)
 }
@@ -194,27 +209,30 @@ func connectPhase(err error) bool {
 	if errors.As(err, &opErr) {
 		return opErr.Op == "dial"
 	}
+
 	var unknown net.UnknownNetworkError
 	if errors.As(err, &unknown) {
 		return true
 	}
+
 	var certErr *tls.CertificateVerificationError
 	if errors.As(err, &certErr) {
 		return true
 	}
+
 	var authErr x509.UnknownAuthorityError
 	if errors.As(err, &authErr) {
 		return true
 	}
+
 	var hostErr x509.HostnameError
 	if errors.As(err, &hostErr) {
 		return true
 	}
+
 	var recErr tls.RecordHeaderError
-	if errors.As(err, &recErr) {
-		return true
-	}
-	return false
+
+	return errors.As(err, &recErr)
 }
 
 // retryAfterWait parses the Retry-After header (delay-seconds or
@@ -227,14 +245,17 @@ func retryAfterWait(h http.Header, limit time.Duration) time.Duration {
 	if v == "" {
 		return 0
 	}
+
 	if secs, err := strconv.Atoi(v); err == nil {
 		if secs <= 0 {
 			return 0
 		}
+
 		wait := time.Duration(secs) * time.Second
 		if secs > int(limit/time.Second)+1 || wait > limit || wait < 0 {
 			return limit
 		}
+
 		return wait
 	} else if allDigits(v) {
 		// A strconv-overflowing delay-seconds value is still a valid
@@ -242,16 +263,20 @@ func retryAfterWait(h http.Header, limit time.Duration) time.Duration {
 		// the Duration conversion or ignoring the header.
 		return limit
 	}
+
 	if t, err := http.ParseTime(v); err == nil {
 		wait := time.Until(t)
 		if wait <= 0 {
 			return 0
 		}
+
 		if wait > limit {
 			return limit
 		}
+
 		return wait
 	}
+
 	return 0
 }
 
@@ -261,37 +286,44 @@ func allDigits(s string) bool {
 	if s == "" {
 		return false
 	}
+
 	for _, r := range s {
 		if r < '0' || r > '9' {
 			return false
 		}
 	}
+
 	return true
 }
 
 // backoff computes the bounded exponential ladder with full jitter:
-// a uniform sample from [0, min(BaseWait * 2^(attempt-1), max)).
-func backoff(base, max time.Duration, attempt int) time.Duration {
+// a uniform sample from [0, min(BaseWait * 2^(attempt-1), limit)).
+func backoff(base, limit time.Duration, attempt int) time.Duration {
 	if base <= 0 {
 		return 0
 	}
+
 	bound := base
+
 	if shift := attempt - 1; shift > 0 {
-		if shift > 20 { // cap before shift overflow; max dominates anyway
-			bound = max
+		if shift > 20 { // cap before shift overflow; limit dominates anyway
+			bound = limit
 		} else {
 			bound = base << shift
-			if bound <= 0 || bound > max { // overflow guard
-				bound = max
+			if bound <= 0 || bound > limit { // overflow guard
+				bound = limit
 			}
 		}
 	}
-	if bound > max {
-		bound = max
+
+	if bound > limit {
+		bound = limit
 	}
+
 	if bound <= 0 {
 		return 0
 	}
+
 	return time.Duration(rand.Int64N(int64(bound)))
 }
 
@@ -302,8 +334,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
+
 	t := time.NewTimer(d)
 	defer t.Stop()
+
 	select {
 	case <-t.C:
 		return true
@@ -317,11 +351,14 @@ func rewindBody(req *http.Request) error {
 	if req.Body == nil || req.GetBody == nil {
 		return nil
 	}
+
 	body, err := req.GetBody()
 	if err != nil {
 		return fmt.Errorf("httpx: rewind request body for retry: %w", err)
 	}
+
 	req.Body = body
+
 	return nil
 }
 
@@ -331,6 +368,7 @@ func drainAndClose(resp *http.Response) {
 	if resp.Body == nil {
 		return
 	}
+
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	_ = resp.Body.Close()
 }

@@ -105,22 +105,29 @@ func (o Options) Encode() url.Values {
 	set1("skip_first_archive", o.SkipFirstArchive)
 	set1("outlinks_availability", o.OutlinksAvailability)
 	set1("email_result", o.EmailResult)
+
 	if o.IfNotArchivedWithin != "" {
 		v.Set("if_not_archived_within", o.IfNotArchivedWithin)
 	}
+
 	v.Set("js_behavior_timeout", strconv.Itoa(o.JSBehaviorTimeout))
+
 	if o.CaptureCookie != "" {
 		v.Set("capture_cookie", o.CaptureCookie)
 	}
+
 	if o.UseUserAgent != "" {
 		v.Set("use_user_agent", o.UseUserAgent)
 	}
+
 	if o.TargetUsername != "" {
 		v.Set("target_username", o.TargetUsername)
 	}
+
 	if o.TargetPassword != "" {
 		v.Set("target_password", o.TargetPassword)
 	}
+
 	return v
 }
 
@@ -161,8 +168,10 @@ func (c *Client) Submit(ctx context.Context, targetURL string, o Options) (Submi
 	if targetURL == "" {
 		return SubmitResult{}, errors.New("не указан адрес страницы (URL) для сохранения")
 	}
+
 	form := o.Encode()
 	form.Set("url", targetURL)
+
 	code, data, err := c.doForm(ctx, http.MethodPost, baseURL, form, httpx.RetryOpts{Mode: httpx.RetryConnectOnly})
 	if err != nil {
 		return SubmitResult{}, fmt.Errorf("отправка запроса на сохранение не выполнена: %w", err)
@@ -176,15 +185,19 @@ func (c *Client) Submit(ctx context.Context, targetURL string, o Options) (Submi
 			Message: "ответ не является JSON: " + oneLine(data),
 		}
 	}
+
 	if env.JobID != nil && *env.JobID != "" {
 		return SubmitResult{JobID: *env.JobID, Message: env.Message}, nil
 	}
+
 	if env.Status == "error" {
 		return SubmitResult{}, classifyEnvelope(env.StatusExt, env.Message, code)
 	}
+
 	if env.Message != "" {
 		return SubmitResult{Deduped: true, Message: env.Message}, nil
 	}
+
 	return SubmitResult{}, &Error{
 		Kind:    KindRetryable,
 		HTTP:    code,
@@ -201,14 +214,18 @@ func (c *Client) Status(ctx context.Context, jobID string) (Status, error) {
 	if jobID == "" {
 		return Status{}, errors.New("не указан идентификатор задания")
 	}
+
 	endpoint := baseURL + "/status/" + url.PathEscape(jobID)
+
 	code, data, err := c.doForm(ctx, http.MethodGet, endpoint, nil, c.retry)
 	if err != nil {
 		return Status{}, fmt.Errorf("получение статуса задания не выполнено: %w", err)
 	}
+
 	if !is2xx(code) {
 		return Status{}, probeTransportError(code, "статуса задания", data)
 	}
+
 	var st Status
 	if jerr := json.Unmarshal(data, &st); jerr != nil {
 		return Status{}, &Error{
@@ -217,6 +234,7 @@ func (c *Client) Status(ctx context.Context, jobID string) (Status, error) {
 			Message: "статус задания: ответ не является JSON: " + oneLine(data),
 		}
 	}
+
 	return st, nil
 }
 
@@ -225,6 +243,7 @@ func (c *Client) StatusBatch(ctx context.Context, jobIDs []string) ([]Status, er
 	if len(jobIDs) == 0 {
 		return nil, errors.New("не указаны идентификаторы заданий")
 	}
+
 	return c.postStatusList(ctx, url.Values{"job_ids": {strings.Join(jobIDs, ",")}})
 }
 
@@ -234,6 +253,7 @@ func (c *Client) StatusOutlinks(ctx context.Context, parentJobID string) ([]Stat
 	if parentJobID == "" {
 		return nil, errors.New("не указан идентификатор родительского задания")
 	}
+
 	return c.postStatusList(ctx, url.Values{"job_id_outlinks": {parentJobID}})
 }
 
@@ -246,9 +266,11 @@ func (c *Client) postStatusList(ctx context.Context, form url.Values) ([]Status,
 	if err != nil {
 		return nil, fmt.Errorf("получение статусов заданий не выполнено: %w", err)
 	}
+
 	if !is2xx(code) {
 		return nil, probeTransportError(code, "статусов заданий", data)
 	}
+
 	var sts []Status
 	if jerr := json.Unmarshal(data, &sts); jerr != nil {
 		return nil, &Error{
@@ -257,6 +279,7 @@ func (c *Client) postStatusList(ctx context.Context, form url.Values) ([]Status,
 			Message: "статусы заданий: ответ не является JSON-массивом: " + oneLine(data),
 		}
 	}
+
 	return sts, nil
 }
 
@@ -265,13 +288,16 @@ func (c *Client) postStatusList(ctx context.Context, form url.Values) ([]Status,
 // a stale cached answer.
 func (c *Client) UserStatus(ctx context.Context) (available, processing int, err error) {
 	endpoint := fmt.Sprintf("%s/status/user?_t=%d", baseURL, time.Now().UnixMilli())
+
 	code, data, err := c.doForm(ctx, http.MethodGet, endpoint, nil, c.retry)
 	if err != nil {
 		return 0, 0, fmt.Errorf("получение квоты сеансов не выполнено: %w", err)
 	}
+
 	if !is2xx(code) {
 		return 0, 0, probeTransportError(code, "квоты сеансов", data)
 	}
+
 	var payload struct {
 		Available  int `json:"available"`
 		Processing int `json:"processing"`
@@ -283,6 +309,7 @@ func (c *Client) UserStatus(ctx context.Context) (available, processing int, err
 			Message: "квота сеансов: ответ не является JSON: " + oneLine(data),
 		}
 	}
+
 	return payload.Available, payload.Processing, nil
 }
 
@@ -297,6 +324,7 @@ func (c *Client) SystemStatus(ctx context.Context) (ok bool, overloaded bool, er
 	if err != nil {
 		return false, false, fmt.Errorf("проверка состояния службы не выполнена: %w", err)
 	}
+
 	if code == http.StatusBadGateway {
 		return false, false, &Error{
 			Kind:    KindRetryable,
@@ -304,6 +332,7 @@ func (c *Client) SystemStatus(ctx context.Context) (ok bool, overloaded bool, er
 			Message: "служба SPN2 в критическом состоянии",
 		}
 	}
+
 	var payload struct {
 		Status string `json:"status"`
 	}
@@ -314,9 +343,11 @@ func (c *Client) SystemStatus(ctx context.Context) (ok bool, overloaded bool, er
 			Message: "состояние службы: ответ не является JSON: " + oneLine(data),
 		}
 	}
+
 	if payload.Status == "ok" {
 		return true, false, nil
 	}
+
 	return false, true, nil
 }
 
@@ -329,14 +360,18 @@ func (c *Client) doForm(ctx context.Context, method, endpoint string, form url.V
 	if form != nil {
 		body = strings.NewReader(form.Encode())
 	}
+
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("построить запрос spn2: %w", err)
 	}
+
 	req.Header.Set("Accept", "application/json")
+
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 	}
+
 	c.Creds.SPN2Request(req)
 
 	resp, err := c.HTTP.DoWithRetry(ctx, req, opts)
@@ -347,10 +382,12 @@ func (c *Client) doForm(ctx context.Context, method, endpoint string, form url.V
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
 		_ = resp.Body.Close()
 	}()
+
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("чтение ответа spn2 (HTTP %d): %w", resp.StatusCode, err)
 	}
+
 	return resp.StatusCode, data, nil
 }
 
@@ -384,7 +421,7 @@ type Status struct {
 //   - object outlink → child job_id string → OutlinkJobs (capture_outlinks=1);
 //   - object outlink → {"timestamp": "..."} → OutlinkTimestamps
 //     (outlinks_availability=1), where a null timestamp maps to "".
-func (s *Status) UnmarshalJSON(data []byte) error {
+func (s *Status) UnmarshalJSON(data []byte) error { //nolint:gocognit // per-field SPN2 shape normalization; 34 vs cap 30
 	var raw struct {
 		Status       string          `json:"status"`
 		JobID        string          `json:"job_id"`
@@ -405,12 +442,15 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+
 	s.State = raw.Status
 	s.JobID = raw.JobID
+
 	s.OriginalURL = raw.OriginalURL
 	if s.OriginalURL == "" {
 		s.OriginalURL = raw.URL
 	}
+
 	s.Timestamp = raw.Timestamp
 	s.DurationSec = raw.DurationSec
 	s.Resources = raw.Resources
@@ -426,18 +466,21 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
 	}
+
 	switch trimmed[0] {
 	case '[':
 		var list []string
 		if err := json.Unmarshal(trimmed, &list); err != nil {
 			return fmt.Errorf("разобрать outlinks (массив): %w", err)
 		}
+
 		s.Outlinks = list
 	case '{':
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal(trimmed, &obj); err != nil {
 			return fmt.Errorf("разобрать outlinks (объект): %w", err)
 		}
+
 		for link, v := range obj {
 			val := bytes.TrimSpace(v)
 			if len(val) > 0 && val[0] == '{' {
@@ -447,26 +490,33 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 				if err := json.Unmarshal(val, &avail); err != nil {
 					return fmt.Errorf("разобрать outlinks_availability для %s: %w", link, err)
 				}
+
 				if s.OutlinkTimestamps == nil {
 					s.OutlinkTimestamps = map[string]string{}
 				}
+
 				if avail.Timestamp != nil {
 					s.OutlinkTimestamps[link] = *avail.Timestamp
 				} else {
 					s.OutlinkTimestamps[link] = ""
 				}
+
 				continue
 			}
+
 			var jobID string
 			if err := json.Unmarshal(val, &jobID); err != nil {
 				return fmt.Errorf("разобрать outlink job_id для %s: %w", link, err)
 			}
+
 			if s.OutlinkJobs == nil {
 				s.OutlinkJobs = map[string]string{}
 			}
+
 			s.OutlinkJobs[link] = jobID
 		}
 	}
+
 	return nil
 }
 
@@ -477,6 +527,7 @@ func oneLine(data []byte) string {
 	if s == "" {
 		return "(пустое тело ответа)"
 	}
+
 	return truncate(s)
 }
 
@@ -498,6 +549,7 @@ func probeTransportError(code int, what string, body []byte) *Error {
 	if code == http.StatusUnauthorized || code == http.StatusForbidden {
 		kind = KindTerminal
 	}
+
 	return &Error{
 		Kind:    kind,
 		HTTP:    code,
@@ -508,9 +560,11 @@ func probeTransportError(code int, what string, body []byte) *Error {
 // truncate caps s to 200 runes so error messages stay bounded.
 func truncate(s string) string {
 	const maxRunes = 200
+
 	runes := []rune(s)
 	if len(runes) <= maxRunes {
 		return s
 	}
+
 	return string(runes[:maxRunes]) + "…"
 }

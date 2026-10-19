@@ -16,6 +16,8 @@ import (
 // unclassified failure is always fail-open.
 type Kind int
 
+// Capture-failure kinds, ordered by severity: retryable now, quota later,
+// terminal never.
 const (
 	KindRetryable Kind = iota
 	KindQuota
@@ -49,6 +51,7 @@ type Error struct {
 // Error implements the error interface.
 func (e *Error) Error() string {
 	var b strings.Builder
+
 	switch e.Kind {
 	case KindQuota:
 		b.WriteString("квота archive.org исчерпана (повторите после обновления лимита)")
@@ -57,19 +60,24 @@ func (e *Error) Error() string {
 	default:
 		b.WriteString("ошибка сохранения (возможен повтор)")
 	}
+
 	if e.Message != "" {
 		b.WriteString(": ")
 		b.WriteString(e.Message)
 	}
+
 	if e.StatusExt != "" {
 		fmt.Fprintf(&b, " (код %s", e.StatusExt)
+
 		if e.HTTP != 0 {
 			fmt.Fprintf(&b, ", HTTP %d", e.HTTP)
 		}
+
 		b.WriteString(")")
 	} else if e.HTTP != 0 {
 		fmt.Fprintf(&b, " (HTTP %d)", e.HTTP)
 	}
+
 	return b.String()
 }
 
@@ -134,6 +142,7 @@ var statusExtKinds = map[string]Kind{
 func classifyStatusExt(statusExt string) (Kind, bool) {
 	code := strings.TrimPrefix(strings.TrimSpace(strings.ToLower(statusExt)), "error:")
 	kind, ok := statusExtKinds[code]
+
 	return kind, ok
 }
 
@@ -160,11 +169,13 @@ func classifyMessage(msg string) (Kind, bool) {
 			return KindTerminal, true
 		}
 	}
+
 	for _, m := range retryableMessageMarkers {
 		if strings.Contains(msg, m) {
 			return KindRetryable, true
 		}
 	}
+
 	return KindRetryable, false
 }
 
@@ -174,15 +185,19 @@ func classifyMessage(msg string) (Kind, bool) {
 func classifyEnvelope(statusExt, message string, httpStatus int) *Error {
 	if statusExt != "" {
 		kind, known := classifyStatusExt(statusExt)
+
 		msg := message
 		if !known {
 			msg = "неизвестный код status_ext — классифицировано как повторяемая ошибка: " + message
 		}
+
 		return &Error{Kind: kind, StatusExt: statusExt, Message: msg, HTTP: httpStatus}
 	}
+
 	if kind, known := classifyMessage(message); known {
 		return &Error{Kind: kind, Message: message, HTTP: httpStatus}
 	}
+
 	return &Error{
 		Kind:    KindRetryable,
 		Message: "причина не распознана — классифицировано как повторяемая ошибка: " + message,
@@ -227,13 +242,17 @@ func ParseDelayMessage(msg string) (time.Duration, bool) {
 	if m == nil {
 		return 0, false
 	}
+
 	var total time.Duration
+
 	found := false
+
 	for _, tok := range delayTokenRe.FindAllStringSubmatch(m[1], -1) {
 		unit, ok := delayUnits[strings.ToLower(tok[2])]
 		if !ok {
 			return 0, false
 		}
+
 		n, err := strconv.Atoi(tok[1])
 		if err != nil || n < 0 {
 			return 0, false
@@ -243,11 +262,14 @@ func ParseDelayMessage(msg string) (time.Duration, bool) {
 		if int64(n) > math.MaxInt64/int64(unit) {
 			return 0, false
 		}
+
 		total += time.Duration(n) * unit
 		found = true
 	}
+
 	if !found {
 		return 0, false
 	}
+
 	return total, true
 }

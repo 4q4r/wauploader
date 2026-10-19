@@ -52,6 +52,7 @@ func derefString(p *string, fallback string) string {
 	if p == nil || *p == "" {
 		return fallback
 	}
+
 	return *p
 }
 
@@ -62,9 +63,7 @@ func derefBool(p *bool) bool { return p != nil && *p }
 // t.Cleanup) so a runInit test never touches the network or a real
 // terminal's no-echo read.
 var (
-	bootstrapFn = func(ctx context.Context, cl *httpx.Client, email, password string) (auth.Credentials, error) {
-		return auth.Bootstrap(ctx, cl, email, password)
-	}
+	bootstrapFn    = auth.Bootstrap
 	readPasswordFn = func(stdin *os.File) ([]byte, error) {
 		return term.ReadPassword(int(stdin.Fd()))
 	}
@@ -82,6 +81,7 @@ func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY boo
 	if !stdinTTY || stdin == nil {
 		return nonTTYHint(cfgPath)
 	}
+
 	var outTTY bool
 	if f, ok := out.(*os.File); ok {
 		outTTY = console.IsTTY(f)
@@ -94,24 +94,33 @@ func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY boo
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(errOut, "Пароль (ввод не отображается): ")
+
+	_, _ = fmt.Fprint(errOut, "Пароль (ввод не отображается): ")
+
 	raw, err := readPasswordFn(stdin)
-	fmt.Fprintln(errOut)
+
+	_, _ = fmt.Fprintln(errOut)
+
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать пароль: %w", err)
 	}
+
 	password := string(raw)
+
 	if email == "" {
 		return errors.New("не указан адрес электронной почты archive.org")
 	}
+
 	if password == "" {
 		return errors.New("не указан пароль archive.org")
 	}
 
 	con.Infof("Выполняется вход на archive.org…")
+
 	cl := httpx.NewClient(nil, "")
 	creds, err := bootstrapFn(context.Background(), cl, email, password)
-	password = "" // drop the plaintext reference before any reporting
+	password = "" //nolint:ineffassign // deliberate zeroing of the plaintext reference before any reporting
+
 	if err != nil && !errors.Is(err, auth.ErrCookiesNotReturned) {
 		return err
 	}
@@ -124,7 +133,9 @@ func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY boo
 	if err := auth.SaveToConfig(savePath, creds, ""); err != nil {
 		return err
 	}
+
 	writeInitSuccess(out, errOut, outTTY, noColor, jsonOut, savePath, warnCookies, creds)
+
 	return nil
 }
 
@@ -133,14 +144,17 @@ func promptLine(r io.Reader, w io.Writer, prompt string) (string, error) {
 	if _, err := fmt.Fprint(w, prompt); err != nil {
 		return "", fmt.Errorf("не удалось вывести приглашение: %w", err)
 	}
+
 	line, err := bufio.NewReader(r).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", fmt.Errorf("не удалось прочитать ввод: %w", err)
 	}
+
 	value := strings.TrimSpace(line)
 	if value == "" {
 		return "", errors.New("ввод пуст: укажите значение")
 	}
+
 	return value, nil
 }
 
@@ -152,6 +166,7 @@ func expandHomePath(p string) string {
 			return filepath.Join(home, strings.TrimPrefix(p, "~"))
 		}
 	}
+
 	return p
 }
 
@@ -163,6 +178,7 @@ func expandHomePath(p string) string {
 // auth.ErrCookiesNotReturned's Russian text.
 func writeInitSuccess(out, errOut io.Writer, outTTY, noColor, jsonOut bool, cfgPath string, warnCookies bool, c auth.Credentials) {
 	con := console.New(out, errOut, outTTY, noColor)
+
 	if jsonOut {
 		payload := map[string]any{
 			"event":  "init",
@@ -178,12 +194,16 @@ func writeInitSuccess(out, errOut io.Writer, outTTY, noColor, jsonOut bool, cfgP
 		if warnCookies {
 			payload["warning"] = auth.ErrCookiesNotReturned.Error()
 		}
+
 		con.JSON(payload)
+
 		return
 	}
+
 	if warnCookies {
 		con.Warnf("%s", auth.ErrCookiesNotReturned.Error())
 	}
+
 	con.Successf("Учётные данные сохранены в %s", cfgPath)
 	con.Dimf("s3_access: %s", auth.Mask(c.Access))
 	con.Dimf("s3_secret: %s", auth.Mask(c.Secret))

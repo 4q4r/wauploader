@@ -58,6 +58,7 @@ func (e *ExitError) Error() string {
 	if e == nil || e.Err == nil {
 		return ""
 	}
+
 	return e.Err.Error()
 }
 
@@ -84,10 +85,12 @@ func defaultJournalPath() (string, error) {
 	if x := os.Getenv("XDG_DATA_HOME"); x != "" {
 		return filepath.Join(x, "wauploader", "journal.bbolt"), nil
 	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("не удалось определить домашний каталог для файла журнала: %w", err)
 	}
+
 	return filepath.Join(home, ".local", "share", "wauploader", "journal.bbolt"), nil
 }
 
@@ -101,8 +104,10 @@ func journalPathOr(flagValue string) (string, error) {
 		if err != nil {
 			return "", exitUsage("%v", err)
 		}
+
 		p = def
 	}
+
 	return expandHomePath(p), nil
 }
 
@@ -116,13 +121,16 @@ func loadConfig(path string, warn io.Writer) (*config.Config, error) {
 	if err != nil {
 		return nil, exitUsage("%v", err)
 	}
+
 	unknown, err := config.DetectUnknownKeys(path)
 	if err != nil {
 		return nil, exitUsage("%v", err)
 	}
+
 	for _, key := range unknown {
-		fmt.Fprintf(warn, "? Неизвестный ключ конфигурации %q — проверьте написание в файле %s\n", key, path)
+		_, _ = fmt.Fprintf(warn, "? Неизвестный ключ конфигурации %q — проверьте написание в файле %s\n", key, path)
 	}
+
 	return cfg, nil
 }
 
@@ -139,9 +147,11 @@ func resolveTargets(args []string, listPath string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		if len(targets) == 0 {
 			return nil, fmt.Errorf("файл списка %s не содержит ни одной цели", listPath)
 		}
+
 		return targets, nil
 	default:
 		return nil, errors.New("не указаны цели: перечислите их в аргументах команды или через --list FILE")
@@ -157,14 +167,18 @@ func parseTargetList(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("не удалось прочитать файл списка %s: %w", path, err)
 	}
+
 	var targets []string
+
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
+
 		targets = append(targets, trimmed)
 	}
+
 	return targets, nil
 }
 
@@ -175,6 +189,7 @@ func displayTarget(target string) string {
 	if i := strings.IndexByte(target, 0); i >= 0 {
 		return target[:i] + " → " + target[i+1:]
 	}
+
 	return target
 }
 
@@ -226,14 +241,17 @@ func (p *eventPump) pumpStart(events <-chan runner.Event, con *console.Console, 
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+
 		for ev := range events {
 			if ev.Kind == runner.EventAuth {
 				p.authPaused.Store(true)
 			}
+
 			if jsonMode {
 				con.JSON(eventToJSON(ev))
 				continue
 			}
+
 			if ev.Kind == runner.EventProgress {
 				p.renderProgress(con, ev)
 			}
@@ -248,6 +266,7 @@ func (p *eventPump) renderProgress(con *console.Console, ev runner.Event) {
 	if ev.Total > 0 {
 		pct = int(float64(ev.Sent) / float64(ev.Total) * 100)
 	}
+
 	con.Dimf("Загрузка: %s — %d%% (%s из %s)",
 		displayTarget(ev.Target), pct, console.FormatBytesRU(ev.Sent), console.FormatBytesRU(ev.Total))
 }
@@ -264,17 +283,22 @@ func finishRun(rerr error, summary runner.Summary, authPaused bool) error {
 		if errors.Is(rerr, context.Canceled) {
 			return &ExitError{Code: ExitSomeFailed, Err: errors.New("выполнение прервано: часть задач осталась в журнале и продолжится при следующем запуске")}
 		}
+
 		if authPaused {
 			return &ExitError{Code: ExitAuth, Err: rerr}
 		}
+
 		return &ExitError{Code: ExitUsage, Err: rerr}
 	}
+
 	if authPaused {
 		return exitAuth(errors.New("ошибка авторизации archive.org: выполнение очереди приостановлено — проверьте ключи или куки и запустите снова"))
 	}
+
 	if summary.Failed > 0 || summary.Parked > 0 {
 		return &ExitError{Code: ExitSomeFailed, Err: nil}
 	}
+
 	return nil
 }
 
@@ -286,6 +310,7 @@ func runnerConsole(con *console.Console, jsonMode bool) *console.Console {
 	if jsonMode {
 		return console.New(io.Discard, io.Discard, false, true)
 	}
+
 	return con
 }
 
@@ -331,6 +356,7 @@ func NewRootCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *b
 	root.AddCommand(NewUploadCommand(configPath, journalPath, jsonOut, noColor, dryRun))
 	root.AddCommand(NewStatusCommand(configPath, jsonOut, noColor))
 	root.AddCommand(NewJobsCommand(journalPath, noColor))
+
 	return root
 }
 

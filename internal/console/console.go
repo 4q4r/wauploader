@@ -62,48 +62,53 @@ func (c *Console) colorsEnabled() bool {
 }
 
 // Infof writes an informational line to out (cyan).
-func (c *Console) Infof(format string, a ...any) {
-	c.write(c.out, sgrCyan, "", format, a...)
+func (c *Console) Infof(format string, args ...any) {
+	c.write(c.out, sgrCyan, "", format, args...)
 }
 
 // Successf writes a success line to out (green, ✓).
-func (c *Console) Successf(format string, a ...any) {
-	c.write(c.out, sgrGreen, glyphSuccess, format, a...)
+func (c *Console) Successf(format string, args ...any) {
+	c.write(c.out, sgrGreen, glyphSuccess, format, args...)
 }
 
 // Warnf writes a warning line to out (yellow, ?).
-func (c *Console) Warnf(format string, a ...any) {
-	c.write(c.out, sgrYellow, glyphWarn, format, a...)
+func (c *Console) Warnf(format string, args ...any) {
+	c.write(c.out, sgrYellow, glyphWarn, format, args...)
 }
 
 // Errorf writes an error line to errOut (red, ✗).
-func (c *Console) Errorf(format string, a ...any) {
-	c.write(c.errOut, sgrRed, glyphError, format, a...)
+func (c *Console) Errorf(format string, args ...any) {
+	c.write(c.errOut, sgrRed, glyphError, format, args...)
 }
 
 // Dimf writes a secondary line to out (dim, ·): hashes, identifiers.
-func (c *Console) Dimf(format string, a ...any) {
-	c.write(c.out, sgrDim, glyphDim, format, a...)
+func (c *Console) Dimf(format string, args ...any) {
+	c.write(c.out, sgrDim, glyphDim, format, args...)
 }
 
 // write emits one line: color, optional glyph, formatted message, reset,
 // newline. With the color gate closed the bytes are identical without the
 // escape sequences. Write errors are ignored: the console surface has no
 // error return, and a broken pipe on stdout must not panic the process.
-func (c *Console) write(w io.Writer, color, glyph, format string, a ...any) {
+func (c *Console) write(w io.Writer, color, glyph, format string, args ...any) {
 	var b strings.Builder
+
 	colored := c.colorsEnabled()
 	if colored {
 		b.WriteString(color)
 	}
+
 	if glyph != "" {
 		b.WriteString(glyph)
 		b.WriteByte(' ')
 	}
-	fmt.Fprintf(&b, format, a...)
+
+	fmt.Fprintf(&b, format, args...)
+
 	if colored {
 		b.WriteString(sgrReset)
 	}
+
 	b.WriteByte('\n')
 	_, _ = io.WriteString(w, b.String())
 }
@@ -115,9 +120,10 @@ func (c *Console) write(w io.Writer, color, glyph, format string, a ...any) {
 func (c *Console) JSON(v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		fmt.Fprintf(c.errOut, "%s Ошибка форматирования JSON: %v\n", glyphError, err)
+		_, _ = fmt.Fprintf(c.errOut, "%s Ошибка форматирования JSON: %v\n", glyphError, err)
 		return
 	}
+
 	_, _ = c.out.Write(append(data, '\n'))
 }
 
@@ -126,6 +132,7 @@ func IsTTY(f *os.File) bool {
 	if f == nil {
 		return false
 	}
+
 	return term.IsTerminal(int(f.Fd()))
 }
 
@@ -136,12 +143,15 @@ func FormatBytesRU(n int64) string {
 	if n < 0 {
 		n = -n
 	}
+
 	value := float64(n)
+
 	unit := 0
 	for value >= 1024 && unit < len(byteUnits)-1 {
 		value /= 1024
 		unit++
 	}
+
 	return strings.Replace(strconv.FormatFloat(value, 'f', 1, 64), ".", ",", 1) +
 		" " + byteUnits[unit]
 }

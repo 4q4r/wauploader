@@ -2,6 +2,7 @@
 // SPN2 job, of the user's capture session (--user), or of the SPN2 service
 // (--system). Exactly one of the three selectors is required (usage error
 // otherwise). Every result is one JSON object in --json mode.
+
 package commands
 
 import (
@@ -30,6 +31,7 @@ type statusJobJSON struct {
 // NewStatusCommand builds the `status` subcommand.
 func NewStatusCommand(configPath *string, jsonOut, noColor *bool) *cobra.Command {
 	var userMode, systemMode bool
+
 	cmd := &cobra.Command{
 		Use:          "status [JOB_ID | --user | --system]",
 		Short:        "Показать статус задачи SPN2, сессии пользователя или службы",
@@ -40,15 +42,19 @@ func NewStatusCommand(configPath *string, jsonOut, noColor *bool) *cobra.Command
 			if len(args) == 1 {
 				selected++
 			}
+
 			if userMode {
 				selected++
 			}
+
 			if systemMode {
 				selected++
 			}
+
 			if selected != 1 {
 				return exitUsage("укажите ровно одно: идентификатор задачи, --user или --system")
 			}
+
 			return runStatus(cmd, args, userMode, systemMode,
 				derefString(configPath, "~/.config/wauploader/wauploader.toml"),
 				derefBool(jsonOut), derefBool(noColor))
@@ -58,6 +64,7 @@ func NewStatusCommand(configPath *string, jsonOut, noColor *bool) *cobra.Command
 		"статус сессии SPN2: сколько заданий доступно и выполняется")
 	cmd.Flags().BoolVar(&systemMode, "system", false,
 		"состояние службы SPN2")
+
 	return cmd
 }
 
@@ -72,10 +79,12 @@ func runStatus(cmd *cobra.Command, args []string, userMode, systemMode bool, cfg
 	if err != nil {
 		return err
 	}
+
 	creds, err := auth.Resolve(cfg)
 	if err != nil {
 		return exitAuth(err)
 	}
+
 	sp := spn2.NewClient(newHTTPClient(), creds)
 	ctx := cmd.Context()
 
@@ -85,20 +94,24 @@ func runStatus(cmd *cobra.Command, args []string, userMode, systemMode bool, cfg
 		if err != nil {
 			return &ExitError{Code: ExitSomeFailed, Err: err}
 		}
+
 		if jsonOut {
 			con.JSON(map[string]int{"available": avail, "processing": processing})
 			return nil
 		}
+
 		con.Infof("Сессия SPN2: доступно %d · выполняется %d", avail, processing)
 	case systemMode:
 		ok, overloaded, err := sp.SystemStatus(ctx)
 		if err != nil {
 			return &ExitError{Code: ExitSomeFailed, Err: err}
 		}
+
 		if jsonOut {
 			con.JSON(map[string]bool{"ok": ok, "overloaded": overloaded})
 			return nil
 		}
+
 		switch {
 		case ok:
 			con.Successf("Служба SPN2: работает")
@@ -112,6 +125,7 @@ func runStatus(cmd *cobra.Command, args []string, userMode, systemMode bool, cfg
 		if err != nil {
 			return &ExitError{Code: ExitSomeFailed, Err: err}
 		}
+
 		if jsonOut {
 			con.JSON(statusJobJSON{
 				Event:        "status",
@@ -127,10 +141,13 @@ func runStatus(cmd *cobra.Command, args []string, userMode, systemMode bool, cfg
 				Exception:    st.Exception,
 				Screenshot:   st.Screenshot,
 			})
+
 			return nil
 		}
+
 		renderJobStatus(con, st)
 	}
+
 	return nil
 }
 
@@ -139,22 +156,28 @@ func runStatus(cmd *cobra.Command, args []string, userMode, systemMode bool, cfg
 // must not advertise a nonexistent snapshot.
 func renderJobStatus(con *console.Console, st spn2.Status) {
 	con.Infof("Статус задачи %s: %s", st.JobID, st.State)
+
 	if st.OriginalURL != "" {
 		con.Dimf("URL: %s", st.OriginalURL)
 	}
+
 	if st.DownloadSize > 0 {
 		con.Dimf("Размер: %s", console.FormatBytesRU(st.DownloadSize))
 	}
+
 	if st.StatusExt != "" {
 		con.Errorf("Ошибка (%s): %s", st.StatusExt, st.Message)
 		return
 	}
+
 	if st.Timestamp != "" {
 		con.Dimf("Снимок: https://web.archive.org/web/%s/%s", st.Timestamp, st.OriginalURL)
 	}
+
 	if st.Message != "" {
 		con.Dimf("Сообщение: %s", st.Message)
 	}
+
 	if st.Exception != "" {
 		con.Dimf("Исключение: %s", st.Exception)
 	}
