@@ -323,7 +323,7 @@ func NewRootCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *b
 	root.PersistentFlags().BoolVar(noColor, "no-color", false,
 		"отключить цветной вывод терминала")
 	root.PersistentFlags().BoolVar(dryRun, "dry-run", false,
-		"показать действия без выполнения: сеть и журнал не затрагиваются (save, upload)")
+		"показать действия без выполнения: сеть и журнал не затрагиваются (save, upload; вывод в человекочитаемом виде; --json на dry-run не действует)")
 
 	root.AddCommand(version.NewVersionCommand(jsonOut))
 	root.AddCommand(NewInitCommand(configPath, jsonOut, noColor))

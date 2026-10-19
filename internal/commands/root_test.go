@@ -149,6 +149,7 @@ type fakeBackend struct {
 	nextJob       int
 	jobTargets    map[string]string
 	failTargets   map[string]bool
+	statusBody    map[string]string
 	userStatusBod string
 }
 
@@ -199,6 +200,7 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 	fb := &fakeBackend{
 		jobTargets:    map[string]string{},
 		failTargets:   map[string]bool{},
+		statusBody:    map[string]string{},
 		userStatusBod: `{"available":2,"processing":0}`,
 	}
 
@@ -251,6 +253,14 @@ func (fb *fakeBackend) setUserStatus(body string) {
 	fb.userStatusBod = body
 }
 
+// setStatus replaces the canned /save/status/<job> body verbatim (used to
+// shape error payloads with wild fields, e.g. a timestamp on a failed job).
+func (fb *fakeBackend) setStatus(job, body string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.statusBody[job] = body
+}
+
 func (fb *fakeBackend) handleSave(w http.ResponseWriter, r *http.Request) {
 	target := r.FormValue("url")
 	fb.mu.Lock()
@@ -268,11 +278,16 @@ func (fb *fakeBackend) handleStatus(w http.ResponseWriter, r *http.Request) {
 	fb.mu.Lock()
 	target, ok := fb.jobTargets[job]
 	failed := ok && fb.failTargets[target]
+	canned := fb.statusBody[job]
 	fb.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if canned != "" {
+		_, _ = io.WriteString(w, canned)
+		return
+	}
 	if !ok {
 		target = "https://example.com/unknown"
 	}
-	w.Header().Set("Content-Type", "application/json")
 	if failed {
 		_, _ = io.WriteString(w, fmt.Sprintf(
 			`{"status":"error","job_id":%q,"original_url":%q,"status_ext":"error:blocked-url","message":"URL в блок-листе Wayback"}`,

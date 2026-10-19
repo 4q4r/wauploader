@@ -134,14 +134,13 @@ func runStatus(cmd *cobra.Command, args []string, userMode, systemMode bool, cfg
 	return nil
 }
 
-// renderJobStatus prints the human form of one job status.
+// renderJobStatus prints the human form of one job status. The Снимок line
+// is gated behind the error check: a failed job with a leftover timestamp
+// must not advertise a nonexistent snapshot.
 func renderJobStatus(con *console.Console, st spn2.Status) {
 	con.Infof("Статус задачи %s: %s", st.JobID, st.State)
 	if st.OriginalURL != "" {
 		con.Dimf("URL: %s", st.OriginalURL)
-	}
-	if st.Timestamp != "" {
-		con.Dimf("Снимок: https://web.archive.org/web/%s/%s", st.Timestamp, st.OriginalURL)
 	}
 	if st.DownloadSize > 0 {
 		con.Dimf("Размер: %s", console.FormatBytesRU(st.DownloadSize))
@@ -149,6 +148,9 @@ func renderJobStatus(con *console.Console, st spn2.Status) {
 	if st.StatusExt != "" {
 		con.Errorf("Ошибка (%s): %s", st.StatusExt, st.Message)
 		return
+	}
+	if st.Timestamp != "" {
+		con.Dimf("Снимок: https://web.archive.org/web/%s/%s", st.Timestamp, st.OriginalURL)
 	}
 	if st.Message != "" {
 		con.Dimf("Сообщение: %s", st.Message)

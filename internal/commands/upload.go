@@ -196,6 +196,9 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	if err != nil {
 		return exitUsage("%v", err)
 	}
+	if f.noDerive && f.waitDerive {
+		return exitUsage("--wait-derive требует очереди деривации — уберите --no-derive")
+	}
 	cfg, err := loadConfig(expandHomePath(cfgPath), errOut)
 	if err != nil {
 		return err
@@ -214,6 +217,13 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	creds, err := auth.Resolve(cfg)
 	if err != nil {
 		return exitAuth(err)
+	}
+	// IA-S3 never accepts cookies (auth.Resolve's doc delegates this to
+	// upload commands): enforce the key pair before any hashing or network
+	// work so a cookies-only configuration fails fast instead of
+	// 403-ing after hashing a 50 GB file.
+	if creds.Access == "" || creds.Secret == "" {
+		return exitAuth(errors.New("загрузка в archive.org выполняется ключами S3: заполните s3_access и s3_secret в файле конфигурации (получить: https://archive.org/account/s3.php) или выполните wauploader init"))
 	}
 	opts, err := headerOptsFrom(cfg, f)
 	if err != nil {

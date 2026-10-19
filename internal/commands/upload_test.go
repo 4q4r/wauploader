@@ -64,6 +64,52 @@ func TestUploadIdentifierFromTemplate(t *testing.T) {
 	require.Equal(t, ExitUsage, r.code)
 }
 
+// TestUploadRequiresKeysUpFront: a cookies-only configuration fails with
+// exit 3 BEFORE any hashing or network work — IA-S3 never accepts cookies
+// (auth.Resolve doc delegation).
+func TestUploadRequiresKeysUpFront(t *testing.T) {
+	fb := newFakeBackend(t)
+	cfg := writeTestConfig(t, `
+[auth]
+cookie_user = "cookieuser"
+cookie_sig = "cookiesig"
+
+[limits]
+save_per_minute = 100000
+save_concurrency = 1
+upload_concurrency = 1
+per_host_concurrency = 1
+job_wait = "20m"
+`)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "big.bin")
+	require.NoError(t, os.WriteFile(file, []byte("payload"), 0o600))
+	jp := filepath.Join(dir, "journal.bbolt")
+
+	r := runRoot(t, "--config", cfg, "--journal", jp, "upload", "--no-derive",
+		"--item", "keys-item-1", "--collection", "movies", "--mediatype", "movies", file)
+	require.Equal(t, ExitAuth, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Empty(t, fb.requests(), "cookie-only config must fail before any HTTP request")
+	require.Contains(t, r.errOut, "s3_access")
+	require.Contains(t, r.errOut, "s3_secret")
+}
+
+// TestUploadDeriveFlagsContradiction: --no-derive and --wait-derive are
+// mutually exclusive; the pair is a usage error (exit 2), never wait-wins.
+func TestUploadDeriveFlagsContradiction(t *testing.T) {
+	newFakeBackend(t)
+	cfg := writeTestConfig(t, testConfigFull)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "f.txt")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+
+	r := runRoot(t, "--config", cfg, "upload", "--no-derive", "--wait-derive",
+		"--item", "contra-item-1", "--collection", "movies", "--mediatype", "movies", file)
+	require.Equal(t, ExitUsage, r.code)
+	require.Contains(t, r.errOut, "--wait-derive")
+	require.Contains(t, r.errOut, "--no-derive")
+}
+
 // TestUploadMetaParsing: NAME=VALUE pairs, repeated names accumulate,
 // malformed pairs are rejected.
 func TestUploadMetaParsing(t *testing.T) {

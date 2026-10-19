@@ -25,17 +25,16 @@ func TestStatusSelection(t *testing.T) {
 	r = runRoot(t, append(base, "status", "job-1", "--user")...)
 	require.Equal(t, ExitUsage, r.code)
 
-	// Human user status.
+	// Human user status (exact line).
 	r = runRoot(t, append(base, "status", "--user")...)
 	require.Equal(t, ExitOK, r.code, "errOut=%s", r.errOut)
-	require.Contains(t, r.out, "3")
-	require.Contains(t, r.out, "1")
+	require.Equal(t, "Сессия SPN2: доступно 3 · выполняется 1", strings.TrimRight(r.out, "\n"))
 
-	// System status reports the fake's ok state in Russian.
+	// System status reports the fake's ok state in Russian (exact line,
+	// glyph included — Successf renders «✓ …»).
 	r = runRoot(t, append(base, "status", "--system")...)
 	require.Equal(t, ExitOK, r.code, "errOut=%s", r.errOut)
-	require.True(t, strings.Contains(r.out, "работает") || strings.Contains(r.out, "ok"),
-		"system line must report the state, got: %q", r.out)
+	require.Equal(t, "✓ Служба SPN2: работает", strings.TrimRight(r.out, "\n"))
 
 	// A job id renders its status; the fake answers success.
 	r = runRoot(t, append(base, "status", "job-1")...)
@@ -48,4 +47,19 @@ func TestStatusSelection(t *testing.T) {
 	lines := nonEmptyLines(r.out)
 	require.Len(t, lines, 1)
 	require.Contains(t, lines[0], `"job_id":"job-1"`)
+}
+
+// TestStatusErrorNoSnapshotLine: a failed job with a leftover timestamp
+// never advertises a snapshot — the Снимок line is gated on success.
+func TestStatusErrorNoSnapshotLine(t *testing.T) {
+	fb := newFakeBackend(t)
+	fb.setStatus("job-9", `{"status":"error","job_id":"job-9","original_url":"https://example.com/e",`+
+		`"timestamp":"20260101010101","status_ext":"error:blocked-url","message":"URL в блок-листе Wayback"}`)
+	cfg := writeTestConfig(t, testConfigFull)
+
+	r := runRoot(t, "--config", cfg, "status", "job-9")
+	require.Equal(t, ExitOK, r.code, "errOut=%s", r.errOut)
+	require.Contains(t, r.errOut, "Ошибка (error:blocked-url)", "the error line rides stderr")
+	require.NotContains(t, r.out, "Снимок", "a failed job must not advertise a snapshot")
+	require.NotContains(t, r.errOut, "Снимок")
 }
