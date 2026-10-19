@@ -35,7 +35,7 @@ func NewStatusCommand(configPath *string, jsonOut, noColor *bool) *cobra.Command
 	cmd := &cobra.Command{
 		Use:          "status [JOB_ID | --user | --system]",
 		Short:        "Показать статус задачи SPN2, сессии пользователя или службы",
-		Args:         cobra.MaximumNArgs(1),
+		Args:         usageMaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			selected := 0

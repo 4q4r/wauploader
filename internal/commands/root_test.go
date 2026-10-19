@@ -375,3 +375,23 @@ func decodeJSONObjects(t *testing.T, out string) []map[string]any {
 	}
 	return maps
 }
+
+// --- exit-code classification of cobra parse errors (exit 2) -----------------
+
+// TestUnknownFlagExits2: a flag-parse error (unknown flag, bad value) is a
+// usage error, mapped through the root's FlagErrorFunc.
+func TestUnknownFlagExits2(t *testing.T) {
+	res := runRoot(t, "save", "--no-such-flag")
+	require.Equal(t, ExitUsage, res.code, "err=%v errOut=%q", res.err, res.errOut)
+	require.Contains(t, res.errOut, "no-such-flag", "the offending flag must be named")
+}
+
+// TestArgsViolationExits2: a positional-args violation (NoArgs and friends)
+// is a usage error, not an unclassified exit 1.
+func TestArgsViolationExits2(t *testing.T) {
+	res := runRoot(t, "init", "unexpected-arg")
+	require.Equal(t, ExitUsage, res.code, "err=%v errOut=%q", res.err, res.errOut)
+
+	res = runRoot(t, "status", "one", "two")
+	require.Equal(t, ExitUsage, res.code, "err=%v errOut=%q", res.err, res.errOut)
+}

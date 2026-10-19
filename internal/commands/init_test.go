@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,12 +17,20 @@ import (
 )
 
 // The non-TTY failure must be actionable: it names the exact TOML keys, the
-// s3.php key-generation URL, and tells the user to run init interactively.
+// s3.php key-generation URL, and tells the user to run init interactively —
+// and it is a usage error (exit 2), not an unclassified failure.
 func TestInitNonTTYFailsActionable(t *testing.T) {
 	var out, errOut strings.Builder
 	err := runInit("/home/u/.config/wauploader/wauploader.toml", false, false, nil, false, &out, &errOut)
 	if err == nil {
 		t.Fatal("runInit returned nil error for non-TTY stdin, want actionable Russian error")
+	}
+	var ee *ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("non-TTY hint must be an *ExitError (usage class), got %T: %v", err, err)
+	}
+	if ee.Code != ExitUsage {
+		t.Errorf("non-TTY hint exit code = %d, want %d", ee.Code, ExitUsage)
 	}
 	msg := err.Error()
 	for _, want := range []string{
@@ -95,6 +105,30 @@ func runInitWithSeams(t *testing.T, jsonOut bool, out, errOut io.Writer) string 
 		t.Fatalf("runInit returned error: %v", err)
 	}
 	return cfgPath
+}
+
+// TestInitBadPasswordExitsAuth: a definitive xauthn credential refusal
+// (wrong password, unknown account — the ErrLoginRefused class) is an
+// auth error (exit 3), not an unclassified failure (exit 1).
+func TestInitBadPasswordExitsAuth(t *testing.T) {
+	overrideBootstrap(t, auth.Credentials{},
+		fmt.Errorf("неверный пароль учётной записи archive.org: %w", auth.ErrLoginRefused))
+	overrideReadPassword(t, "wrong-password")
+
+	var out, errOut strings.Builder
+	err := runInit(filepath.Join(t.TempDir(), "wauploader.toml"), false, false,
+		stdinWithEmail(t, "user@example.com"), true, &out, &errOut)
+
+	var ee *ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("login refusal must be an *ExitError, got %T: %v", err, err)
+	}
+	if ee.Code != ExitAuth {
+		t.Errorf("login refusal exit code = %d, want %d", ee.Code, ExitAuth)
+	}
+	if ee.Err == nil || !strings.Contains(ee.Err.Error(), "неверный пароль") {
+		t.Errorf("the Russian refusal text must survive classification: %v", ee.Err)
+	}
 }
 
 // TestInitKeysWithoutCookiesSavesAndWarns: a successful exchange that
