@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -221,6 +222,50 @@ func TestBootstrapPauseNearDeadlineKeepsCredentials(t *testing.T) {
 	}
 	if elapsed < 100*time.Millisecond {
 		t.Errorf("Bootstrap returned in %v, want the full %v courtesy pause before returning", elapsed, 100*time.Millisecond)
+	}
+}
+
+// TestBootstrapKeysWithoutCookies locks the keys-without-cookies contract:
+// a successful exchange that returns complete S3 keys but no (or a partial)
+// login cookie pair is a USABLE state — Bootstrap returns the keys together
+// with the ErrCookiesNotReturned sentinel, so the caller can persist the
+// keys and warn. Only missing or incomplete keys remain a full failure.
+func TestBootstrapKeysWithoutCookies(t *testing.T) {
+	overridePause(t, 0)
+	fakeXauthn(t, http.StatusOK, `{"success": true, "values": {"s3": {"access": "`+
+		testAccess+`", "secret": "`+testSecret+`"}}}`)
+
+	creds, err := Bootstrap(context.Background(), newTestClient(t), testEmail, testPassword)
+	if !errors.Is(err, ErrCookiesNotReturned) {
+		t.Fatalf("Bootstrap(keys, no cookies) error = %v, want ErrCookiesNotReturned", err)
+	}
+	if creds.Access != testAccess || creds.Secret != testSecret {
+		t.Errorf("keys-only bootstrap lost the keys: %s", creds.String())
+	}
+	if creds.CookieUser != "" || creds.CookieSig != "" {
+		t.Errorf("keys-only bootstrap invented cookies: %s", creds.String())
+	}
+
+	// A half-returned cookie pair is the same usable keys-only state.
+	fakeXauthn(t, http.StatusOK, `{"success": true, "values": {"s3": {"access": "`+
+		testAccess+`", "secret": "`+testSecret+`"}, "cookies": {"logged-in-user": "`+testUser+`"}}}`)
+	creds, err = Bootstrap(context.Background(), newTestClient(t), testEmail, testPassword)
+	if !errors.Is(err, ErrCookiesNotReturned) {
+		t.Fatalf("Bootstrap(keys, half cookies) error = %v, want ErrCookiesNotReturned", err)
+	}
+	if creds.Access != testAccess || creds.Secret != testSecret {
+		t.Errorf("keys-only bootstrap (half cookies) lost the keys: %s", creds.String())
+	}
+
+	// Boundary: success:true with missing keys is still a full failure.
+	fakeXauthn(t, http.StatusOK, `{"success": true, "values": {"cookies": {"logged-in-user": "`+
+		testUser+`", "logged-in-sig": "`+testSig+`"}}}`)
+	creds, err = Bootstrap(context.Background(), newTestClient(t), testEmail, testPassword)
+	if err == nil || errors.Is(err, ErrCookiesNotReturned) {
+		t.Fatalf("Bootstrap(no keys) error = %v, want a full failure distinct from ErrCookiesNotReturned", err)
+	}
+	if creds.Access != "" || creds.Secret != "" {
+		t.Errorf("Bootstrap(no keys) returned keys: %s", creds.String())
 	}
 }
 

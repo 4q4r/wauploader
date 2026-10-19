@@ -54,6 +54,14 @@ const maxBodyRead = 1 << 20
 // maxErrorBody caps the raw response fragment embedded in an error.
 const maxErrorBody = 200
 
+// ErrCookiesNotReturned is returned by Bootstrap together with usable
+// key-only credentials: archive.org confirmed the login and issued the
+// IA-S3 keys, but sent no (or a partial) login cookie pair. Keys work for
+// both SPN2 (auto/keys modes) and IA-S3, so the caller may persist the
+// keys and surface the sentinel's Russian text as a warning instead of
+// failing. It never wraps other errors.
+var ErrCookiesNotReturned = errors.New("куки не получены — SPN2 будет работать по ключам")
+
 // Credentials holds one archive.org identity: IA-S3 keys and the SPN2 login
 // cookies. Any subset may be populated; Resolve guarantees at least one
 // usable form for the selected auth mode.
@@ -265,15 +273,16 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	if v.S3.Access == "" || v.S3.Secret == "" {
 		return Credentials{}, errors.New("вход выполнен, но archive.org не вернул S3-ключи: сгенерируйте их вручную на https://archive.org/account/s3.php")
 	}
+	creds = Credentials{Access: v.S3.Access, Secret: v.S3.Secret}
 	if v.Cookies.LoggedInUser == "" || v.Cookies.LoggedInSig == "" {
-		return Credentials{}, errors.New("вход выполнен, но archive.org не вернул куки входа: SPN2-режим по ключам продолжит работу")
+		// Keys without cookies are a usable state: Resolve accepts
+		// key-only credentials in auto/keys modes, so return the keys and
+		// let the caller decide (persist + warn), never lose them.
+		return creds, ErrCookiesNotReturned
 	}
-	return Credentials{
-		Access:     v.S3.Access,
-		Secret:     v.S3.Secret,
-		CookieUser: v.Cookies.LoggedInUser,
-		CookieSig:  v.Cookies.LoggedInSig,
-	}, nil
+	creds.CookieUser = v.Cookies.LoggedInUser
+	creds.CookieSig = v.Cookies.LoggedInSig
+	return creds, nil
 }
 
 // refusalError builds the Russian failure message for a success:false
