@@ -5,6 +5,7 @@ package runner
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -124,6 +125,100 @@ func TestInterruptedAutoMetaResumeCarriesJournalMeta(t *testing.T) {
 	hdr := f.headers("file2.bin")
 	assert.Equal(t, "Derived Title", hdr.Get("x-archive-meta-title"))
 	assert.Equal(t, "Derived description", hdr.Get("x-archive-meta-description"))
+	assert.Equal(t, "athens", hdr.Get("x-archive-meta00-subject"))
+	assert.Equal(t, "aristophanes frogs", hdr.Get("x-archive-meta01-subject"))
+}
+
+// TestResumeDedupesIdenticalDerivation: resuming with the SAME derivation
+// the journal already holds must not duplicate subject values on the wire
+// (CodeRabbit PR#16 round-2 🟡).
+func TestResumeDedupesIdenticalDerivation(t *testing.T) {
+	f, st, queued := autoMetaResumeFixture(t, "Derived Title",
+		ias3.Meta{"subject": {"athens", "aristophanes frogs"}})
+
+	f.setBlockPutUntilCancel(false)
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	resumed := []UploadTarget{{
+		Path:       queued[0].Path,
+		Identifier: queued[0].Identifier,
+		Key:        queued[0].Key,
+		Title:      "Derived Title",
+		Extra:      ias3.Meta{"subject": {"athens", "aristophanes frogs"}},
+	}}
+
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+
+	hdr := f.headers("file2.bin")
+	assert.Equal(t, "athens", hdr.Get("x-archive-meta00-subject"))
+	assert.Equal(t, "aristophanes frogs", hdr.Get("x-archive-meta01-subject"))
+	assert.Empty(t, hdr.Values("x-archive-meta02-subject"), "identical journal values must not duplicate")
+	assert.Empty(t, hdr.Values("x-archive-meta03-subject"))
+}
+
+// TestResumeUnionsMixedDerivation: fresh values ride first as-is, journal
+// values append only when new for the same key.
+func TestResumeUnionsMixedDerivation(t *testing.T) {
+	f, st, queued := autoMetaResumeFixture(t, "Derived Title",
+		ias3.Meta{"subject": {"athens", "aristophanes frogs"}})
+
+	f.setBlockPutUntilCancel(false)
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	resumed := []UploadTarget{{
+		Path:       queued[0].Path,
+		Identifier: queued[0].Identifier,
+		Key:        queued[0].Key,
+		Extra:      ias3.Meta{"subject": {"athens", "sparta"}},
+	}}
+
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+
+	hdr := f.headers("file2.bin")
+	assert.Equal(t, []string{"athens", "sparta", "aristophanes frogs"}, []string{
+		hdr.Get("x-archive-meta00-subject"),
+		hdr.Get("x-archive-meta01-subject"),
+		hdr.Get("x-archive-meta02-subject"),
+	})
+	assert.Empty(t, hdr.Values("x-archive-meta03-subject"))
+}
+
+// TestRelistedFailedKeepsJournalTitle: a failed file re-listed WITHOUT a
+// fresh derivation must not wipe the persisted metadata — the re-upload
+// still carries the journal-held Title and subjects (round-3 nit).
+func TestRelistedFailedKeepsJournalTitle(t *testing.T) {
+	paths := writeUploadFiles(t, "one", "two")
+	f := newFakeIAS3(t)
+	f.putFn = func(identifier, key string, nth int) int {
+		if key == "file1.bin" && nth == 1 {
+			return http.StatusBadRequest // terminal, no ias3 retry loop
+		}
+
+		return http.StatusOK
+	}
+
+	meta := ias3.Meta{"subject": {"athens", "aristophanes frogs"}}
+	tgts := []UploadTarget{
+		{Path: paths[0], Identifier: "testid-autometa4", Key: "file1.bin", Title: "Derived Title", Description: "Derived description", Extra: meta},
+		{Path: paths[1], Identifier: "testid-autometa4", Key: "file2.bin", Title: "Derived Title", Description: "Derived description", Extra: meta},
+	}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum.Done)
+	require.Equal(t, journal.StateFailed, mustUploadRecord(t, st, tgts[0]).State)
+
+	// Re-list the failed file with NO fresh derivation.
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	relisted := []UploadTarget{{Path: paths[0], Identifier: "testid-autometa4", Key: "file1.bin"}}
+	_, sum2, err := runUploadAll(t, context.Background(), r2, relisted, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+
+	hdr := f.headers("file1.bin")
+	assert.Equal(t, "Derived Title", hdr.Get("x-archive-meta-title"), "empty-fresh re-list must keep the journal Title")
 	assert.Equal(t, "athens", hdr.Get("x-archive-meta00-subject"))
 	assert.Equal(t, "aristophanes frogs", hdr.Get("x-archive-meta01-subject"))
 }

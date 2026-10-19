@@ -16,7 +16,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-func TestKeyForStability(t *testing.T) { // Known-vector: independently recompute the expected digest.
+func TestKeyForStability(t *testing.T) {
+	// Known-vector: independently recompute the expected digest.
 	want := sha256.Sum256([]byte(string(KindSave) + "\x00" + "https://example.com/"))
 	assert.Equal(t, hex.EncodeToString(want[:]), KeyFor(KindSave, "https://example.com/"))
 

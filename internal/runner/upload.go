@@ -386,7 +386,35 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 
 			rec.State = journal.StateQueued
 			rec.ErrKind, rec.ErrMsg = "", ""
-			rec.Title, rec.Description, rec.Extra = t.Title, t.Description, t.Extra
+
+			// Refresh the persisted metadata with the same guard
+			// semantics as mergeFreshMeta: fresh non-empty values win,
+			// persisted values are never wiped by an empty re-listing.
+			if t.Title != "" {
+				rec.Title = t.Title
+			}
+
+			if t.Description != "" {
+				rec.Description = t.Description
+			}
+
+			if len(t.Extra) > 0 {
+				rec.Extra = mergeExtra(t.Extra, rec.Extra)
+			}
+
+			// The in-memory target rides the merged values too, so an
+			// empty-fresh re-list still PUTs the journal-held metadata.
+			if t.Title == "" {
+				t.Title = rec.Title
+			}
+
+			if t.Description == "" {
+				t.Description = rec.Description
+			}
+
+			if len(t.Extra) == 0 {
+				t.Extra = rec.Extra
+			}
 		} else {
 			fresh := &journal.Record{
 				Kind:        journal.KindUpload,
@@ -430,10 +458,44 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 	return items, nil
 }
 
+// mergeExtra unions two Extra maps per key, order-preserving: the fresh
+// values ride as-is first, held (journal) values append ONLY when not
+// already present for that key — an identical re-derivation on resume
+// must not duplicate subject values on the wire.
+func mergeExtra(fresh, held ias3.Meta) ias3.Meta {
+	if len(fresh) == 0 {
+		return held
+	}
+
+	merged := make(ias3.Meta, len(fresh)+len(held))
+	for name, values := range fresh {
+		merged[name] = append(merged[name], values...)
+	}
+
+	for name, values := range held {
+		for _, v := range values {
+			if !containsString(merged[name], v) {
+				merged[name] = append(merged[name], v)
+			}
+		}
+	}
+
+	return merged
+}
+
+func containsString(values []string, v string) bool {
+	for _, s := range values {
+		if s == v {
+			return true
+		}
+	}
+
+	return false
+}
+
 // mergeFreshMeta applies a re-listed target's fresh derivation onto the
 // already-added resume entry: fresh values win when present, the journal
-// fills the rest (per field; Extra: fresh values ride first, journal
-// values append — same order the batch+target overlay uses on the wire).
+// fills the rest (per field; Extra via mergeExtra).
 func mergeFreshMeta(files []uploadFile, tgt string, fresh UploadTarget) {
 	for idx := range files {
 		if files[idx].target != tgt {
@@ -449,16 +511,7 @@ func mergeFreshMeta(files []uploadFile, tgt string, fresh UploadTarget) {
 		}
 
 		if len(fresh.Extra) > 0 {
-			merged := make(ias3.Meta, len(fresh.Extra)+len(files[idx].t.Extra))
-			for name, values := range fresh.Extra {
-				merged[name] = append(merged[name], values...)
-			}
-
-			for name, values := range files[idx].t.Extra {
-				merged[name] = append(merged[name], values...)
-			}
-
-			files[idx].t.Extra = merged
+			files[idx].t.Extra = mergeExtra(fresh.Extra, files[idx].t.Extra)
 		}
 	}
 }
