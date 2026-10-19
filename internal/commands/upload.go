@@ -326,6 +326,13 @@ func headerOptsFrom(cfg *config.Config, f *uploadFlags) (ias3.HeaderOpts, error)
 		return ias3.HeaderOpts{}, err
 	}
 
+	// Names are validated here, at flag-parse time, so a malformed
+	// --meta name is a usage error before any per-file work (poppler
+	// extraction, hashing) — never a late per-file failure.
+	if err := ias3.ValidateExtraMeta(meta); err != nil {
+		return ias3.HeaderOpts{}, err
+	}
+
 	queueDerive := cfg.Upload.QueueDerive
 	if f.noDerive {
 		queueDerive = false
@@ -448,19 +455,20 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 		return exitAuth(errors.New("загрузка в archive.org выполняется ключами S3: заполните s3_access и s3_secret в файле конфигурации (получить: https://archive.org/account/s3.php) или выполните wauploader init"))
 	}
 
-	// Auto-meta derivation runs the external poppler binaries per file,
-	// so it starts only after every cheap fail-fast check above.
+	// Cheap flag validation (incl. the --meta name contract) precedes
+	// the poppler work: a usage error must not be masked by a data
+	// error from per-file extraction.
+	opts, err := headerOptsFrom(cfg, f)
+	if err != nil {
+		return exitUsage("%v", err)
+	}
+
 	var derived []pdfmeta.Meta
 	if f.autoMeta {
 		targets, derived, err = deriveAutoMetaTargets(con, rawPaths, jsonOut)
 		if err != nil {
 			return err
 		}
-	}
-
-	opts, err := headerOptsFrom(cfg, f)
-	if err != nil {
-		return exitUsage("%v", err)
 	}
 
 	if dryRun {

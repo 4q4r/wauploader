@@ -183,6 +183,34 @@ func TestUploadAutoMetaFullRun(t *testing.T) {
 	require.Contains(t, r.out, "Derived Title From PDF")
 }
 
+// TestUploadAutoMetaBadMetaNameFailsBeforePoppler: a malformed --meta name
+// is a usage error (exit 2) BEFORE any poppler invocation — a data error
+// must not mask the usage error (round-4 minor).
+func TestUploadAutoMetaBadMetaNameFailsBeforePoppler(t *testing.T) {
+	newFakeBackend(t)
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "poppler-count")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pdfinfo"),
+		[]byte("#!/bin/sh\necho x >> "+counter+"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pdftotext"),
+		[]byte("#!/bin/sh\necho x >> "+counter+"\n"), 0o755))
+	oldInfo, oldText := pdfmeta.PDFInfoBin, pdfmeta.PdftotextBin
+	pdfmeta.PDFInfoBin = filepath.Join(dir, "pdfinfo")
+	pdfmeta.PdftotextBin = filepath.Join(dir, "pdftotext")
+	t.Cleanup(func() { pdfmeta.PDFInfoBin, pdfmeta.PdftotextBin = oldInfo, oldText })
+
+	cfg := writeTestConfig(t, testConfigFull)
+	file := autoMetaFixture(t)
+
+	r := runRoot(t, "--config", cfg, "upload", "--auto-meta", "--identifier-scheme", "dir-nn-slug",
+		"--collection", "opensource_texts", "--mediatype", "texts", "--meta", "bad name=x", file)
+	require.Equal(t, ExitUsage, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.errOut, "bad name")
+
+	b, err := os.ReadFile(counter)
+	require.True(t, os.IsNotExist(err) || len(b) == 0, "poppler must not run: %s (%v)", string(b), err)
+}
+
 // TestUploadAutoMetaLanguageRusPlan: the cyrillic heuristic flips to rus
 // end-to-end from the pdftotext fake.
 func TestUploadAutoMetaLanguageRusPlan(t *testing.T) {
