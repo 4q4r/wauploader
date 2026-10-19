@@ -334,6 +334,10 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 			return nil, fmt.Errorf("запись журнала повреждена — не разбирается как цель загрузки: %q", rec.Target)
 		}
 
+		// Restore the persisted per-target metadata (--auto-meta): a
+		// resumed upload must rebuild the same PUT headers.
+		t.Title, t.Description, t.Extra = rec.Title, rec.Description, rec.Extra
+
 		add(t, &rec)
 	}
 
@@ -345,6 +349,11 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 
 		tgt := uploadRecordTarget(t)
 		if seen[tgt] {
+			// Queued in a previous run AND re-listed now: merge the fresh
+			// derivation onto the resume entry (fresh wins, journal
+			// fills — mergeFreshMeta).
+			mergeFreshMeta(byItem[t.Identifier], tgt, t)
+
 			continue
 		}
 
@@ -365,16 +374,28 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 		if ok {
 			// failed or skipped in a previous run: an explicit re-list
 			// resets the work fields but keeps the record — and the
-			// persisted digests, so the file is not re-hashed.
-			if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, resetRecord); err != nil {
+			// persisted digests, so the file is not re-hashed. The
+			// per-target metadata is refreshed from the fresh derivation.
+			if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, func(m *journal.Record) {
+				resetRecord(m)
+				m.Title, m.Description, m.Extra = t.Title, t.Description, t.Extra
+			}); err != nil {
 				r.con.Errorf("Не удалось сбросить запись журнала для %s: %v", t.Path, err)
 				return nil, fmt.Errorf("сброс записи журнала не выполнен: %w", err)
 			}
 
 			rec.State = journal.StateQueued
 			rec.ErrKind, rec.ErrMsg = "", ""
+			rec.Title, rec.Description, rec.Extra = t.Title, t.Description, t.Extra
 		} else {
-			fresh := &journal.Record{Kind: journal.KindUpload, Target: tgt, State: journal.StateQueued}
+			fresh := &journal.Record{
+				Kind:        journal.KindUpload,
+				Target:      tgt,
+				State:       journal.StateQueued,
+				Title:       t.Title,
+				Description: t.Description,
+				Extra:       t.Extra,
+			}
 			if err := r.st.Put(fresh); err != nil {
 				r.con.Errorf("Не удалось создать запись журнала для %s: %v", t.Path, err)
 				return nil, fmt.Errorf("создание записи журнала не выполнено: %w", err)
@@ -407,6 +428,39 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 	}
 
 	return items, nil
+}
+
+// mergeFreshMeta applies a re-listed target's fresh derivation onto the
+// already-added resume entry: fresh values win when present, the journal
+// fills the rest (per field; Extra: fresh values ride first, journal
+// values append — same order the batch+target overlay uses on the wire).
+func mergeFreshMeta(files []uploadFile, tgt string, fresh UploadTarget) {
+	for idx := range files {
+		if files[idx].target != tgt {
+			continue
+		}
+
+		if fresh.Title != "" {
+			files[idx].t.Title = fresh.Title
+		}
+
+		if fresh.Description != "" {
+			files[idx].t.Description = fresh.Description
+		}
+
+		if len(fresh.Extra) > 0 {
+			merged := make(ias3.Meta, len(fresh.Extra)+len(files[idx].t.Extra))
+			for name, values := range fresh.Extra {
+				merged[name] = append(merged[name], values...)
+			}
+
+			for name, values := range files[idx].t.Extra {
+				merged[name] = append(merged[name], values...)
+			}
+
+			files[idx].t.Extra = merged
+		}
+	}
 }
 
 // putOptions materializes one file's PUT option set from the batch
@@ -744,6 +798,11 @@ func (r *UploadRunner) persist(f *uploadFile, st journal.State) error {
 		m.Size = f.rec.Size
 		m.ErrKind = f.rec.ErrKind
 		m.ErrMsg = f.rec.ErrMsg
+		// Per-target metadata (--auto-meta): set once at record creation,
+		// carried through every persist so a resume rebuilds the PUT.
+		m.Title = f.rec.Title
+		m.Description = f.rec.Description
+		m.Extra = f.rec.Extra
 	})
 	if err == nil {
 		f.rec.State = st

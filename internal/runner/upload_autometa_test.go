@@ -7,6 +7,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,4 +71,88 @@ func TestNoTargetMetaKeepsBatchHeaders(t *testing.T) {
 	hdr := f.headers(tgt.Key)
 	assert.Equal(t, "Batch Title", hdr.Get("x-archive-meta-title"))
 	assert.Empty(t, hdr.Get("x-archive-meta-language"))
+}
+
+// autoMetaResumeFixture: a 2-file batch whose SECOND file's PUT hangs until
+// the context is cancelled — the interrupt leaves it queued (resumable),
+// while the first file completes. Returns the store for the resumed run.
+func autoMetaResumeFixture(t *testing.T, title string, extra ias3.Meta) (*fakeIAS3, *journal.Store, []UploadTarget) {
+	t.Helper()
+	paths := writeUploadFiles(t, "one", "two")
+	f := newFakeIAS3(t)
+	f.blockPutUntilCancel = true
+	f.blockPutKey = "file2.bin"
+
+	tgts := []UploadTarget{
+		{Path: paths[0], Identifier: "testid-autometa3", Key: "file1.bin", Title: title, Description: "Derived description", Extra: extra},
+		{Path: paths[1], Identifier: "testid-autometa3", Key: "file2.bin", Title: title, Description: "Derived description", Extra: extra},
+	}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	canceler := make(chan struct{})
+	go func() {
+		defer close(canceler)
+		assert.Eventually(t, func() bool { return f.puts("file2.bin") == 1 },
+			2*time.Second, 2*time.Millisecond, "the second PUT must start before the cancel")
+		cancel()
+	}()
+	_, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), false, false)
+	<-canceler
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, journal.StateQueued, mustUploadRecord(t, st, tgts[1]).State)
+
+	return f, st, []UploadTarget{tgts[1]}
+}
+
+// TestInterruptedAutoMetaResumeCarriesJournalMeta (CodeRabbit PR#16
+// Major): the resumed run reconstructs the queued file's target from the
+// journal — the persisted per-target metadata must ride the PUT.
+func TestInterruptedAutoMetaResumeCarriesJournalMeta(t *testing.T) {
+	f, st, queued := autoMetaResumeFixture(t, "Derived Title",
+		ias3.Meta{"subject": {"athens", "aristophanes frogs"}})
+
+	// Resume WITHOUT in-memory metadata: the journal must supply it all.
+	f.setBlockPutUntilCancel(false)
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	resumed := []UploadTarget{{Path: queued[0].Path, Identifier: queued[0].Identifier, Key: queued[0].Key}}
+
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+
+	hdr := f.headers("file2.bin")
+	assert.Equal(t, "Derived Title", hdr.Get("x-archive-meta-title"))
+	assert.Equal(t, "Derived description", hdr.Get("x-archive-meta-description"))
+	assert.Equal(t, "athens", hdr.Get("x-archive-meta00-subject"))
+	assert.Equal(t, "aristophanes frogs", hdr.Get("x-archive-meta01-subject"))
+}
+
+// TestRelistedTargetPrefersFreshDerivation: the merge rule — fresh
+// derivation wins when present, the journal fills the rest (per field;
+// Extra: fresh values ride first, journal values append).
+func TestRelistedTargetPrefersFreshDerivation(t *testing.T) {
+	f, st, queued := autoMetaResumeFixture(t, "Derived Title",
+		ias3.Meta{"subject": {"athens", "aristophanes frogs"}})
+
+	f.setBlockPutUntilCancel(false)
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	resumed := []UploadTarget{{
+		Path:       queued[0].Path,
+		Identifier: queued[0].Identifier,
+		Key:        queued[0].Key,
+		Title:      "Fresh Title",
+		Extra:      ias3.Meta{"subject": {"sparta"}},
+	}}
+
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+
+	hdr := f.headers("file2.bin")
+	assert.Equal(t, "Fresh Title", hdr.Get("x-archive-meta-title"), "fresh derivation wins")
+	assert.Equal(t, "Derived description", hdr.Get("x-archive-meta-description"), "journal fills the field fresh lacks")
+	assert.Equal(t, "sparta", hdr.Get("x-archive-meta00-subject"), "fresh values ride first")
+	assert.Equal(t, "athens", hdr.Get("x-archive-meta01-subject"), "journal values append")
+	assert.Equal(t, "aristophanes frogs", hdr.Get("x-archive-meta02-subject"))
 }

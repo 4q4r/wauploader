@@ -350,3 +350,12 @@ func TestIdentifierExtremesStillValid(t *testing.T) {
 	require.Equal(t, "a-1-x", id)
 	require.NoError(t, ias3.ValidateIdentifier(id))
 }
+
+// A directory name that cannot fold into identifier characters (cyrillic)
+// fails with the explicit rename guidance, not the generic validation
+// error (fix round 2).
+func TestIdentifierCyrillicDirExplicitError(t *testing.T) {
+	_, err := Identifier("Афины", "01_x.pdf")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `имя каталога "Афины" не свёртывается в допустимые символы идентификатора — используйте латиницу`)
+}

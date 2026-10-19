@@ -397,9 +397,14 @@ func Identifier(dirName, fileName string) (string, error) {
 		return "", fmt.Errorf("не удалось прочитать номер из имени файла «%s»: %w", base, err)
 	}
 
+	dir := slugify(dirName)
+	if dir == "" {
+		return "", fmt.Errorf("имя каталога %q не свёртывается в допустимые символы идентификатора — используйте латиницу", dirName)
+	}
+
 	slug := slugify(strings.TrimPrefix(stem, nn[1]))
 
-	id := slugify(dirName) + "-" + strconv.Itoa(num)
+	id := dir + "-" + strconv.Itoa(num)
 	if slug != "" {
 		id += "-" + slug
 	}
