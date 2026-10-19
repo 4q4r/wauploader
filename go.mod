@@ -7,7 +7,9 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.etcd.io/bbolt v1.5.0
+	golang.org/x/sync v0.24.0
 	golang.org/x/term v0.47.0
+	golang.org/x/time v0.16.0
 )
 
 require (
