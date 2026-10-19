@@ -62,14 +62,20 @@ type Credentials struct {
 	CookieSig  string
 }
 
+// String renders every field through Mask so that an accidental %v of
+// credentials (a log line, an error wrap) can never print a full secret.
+func (c Credentials) String() string {
+	return fmt.Sprintf("Credentials{s3_access: %s, s3_secret: %s, cookie_user: %s, cookie_sig: %s}",
+		Mask(c.Access), Mask(c.Secret), Mask(c.CookieUser), Mask(c.CookieSig))
+}
+
 // xauthnResponse mirrors the xauthn login JSON envelope.
 type xauthnResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error"`
 	Values  struct {
-		Reason     string `json:"reason"`
-		Screenname string `json:"screenname"`
-		S3         struct {
+		Reason string `json:"reason"`
+		S3     struct {
 			Access string `json:"access"`
 			Secret string `json:"secret"`
 		} `json:"s3"`
@@ -236,7 +242,17 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 		return Credentials{}, fmt.Errorf("вход archive.org: неожиданный ответ (HTTP %d): %w", resp.StatusCode, err)
 	}
 	if !payload.Success {
-		return Credentials{}, refusalError(&payload, raw, resp.StatusCode, email)
+		// The refusal envelope is only trusted on 2xx: a cached or proxy
+		// error page (e.g. 502) that happens to carry success:false must
+		// not be read as a credential failure.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return Credentials{}, refusalError(&payload, raw, resp.StatusCode, email)
+		}
+		detail := truncate(strings.TrimSpace(string(raw)), maxErrorBody)
+		if detail == "" {
+			detail = http.StatusText(resp.StatusCode)
+		}
+		return Credentials{}, fmt.Errorf("вход archive.org не выполнен (HTTP %d): %s", resp.StatusCode, detail)
 	}
 	v := payload.Values
 	if v.S3.Access == "" || v.S3.Secret == "" {
@@ -309,13 +325,26 @@ func truncate(s string, max int) string {
 	return s
 }
 
+// sanitizeComment strips C0 control characters (including \n, \r, \t) and
+// DEL from screenname before it is embedded in a TOML comment, so a hostile
+// or malformed value cannot forge config lines. Empty result yields no comment.
+func sanitizeComment(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // SaveToConfig merges the credentials into the [auth] section of the TOML
 // file at path (creating it and its directory when missing), leaving every
 // unrelated section byte-compatible in value. The write is atomic
 // (temp file + rename) and the file ends with permission 0600. The password
-// is not a parameter and is never stored; screenname, when non-empty, is
-// kept as an informational comment because the config schema has no field
-// for it (writing a schema key would trip unknown-key detection).
+// is not a parameter and is never stored; screenname — a reserved parameter
+// for a future caller that has it (e.g. T12 wiring) — is kept as a
+// sanitized informational comment when non-empty, because the config schema
+// has no field for it (writing a schema key would trip unknown-key detection).
 func SaveToConfig(path string, c Credentials, screenname string) error {
 	base := map[string]any{}
 	if data, err := os.ReadFile(path); err == nil {
@@ -338,7 +367,7 @@ func SaveToConfig(path string, c Credentials, screenname string) error {
 
 	var buf bytes.Buffer
 	if screenname != "" {
-		fmt.Fprintf(&buf, "# Аккаунт archive.org: %s\n", screenname)
+		fmt.Fprintf(&buf, "# Аккаунт archive.org: %s\n", sanitizeComment(screenname))
 	}
 	if err := toml.NewEncoder(&buf).Encode(base); err != nil {
 		return fmt.Errorf("не удалось сформировать файл конфигурации: %w", err)

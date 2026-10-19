@@ -425,3 +425,72 @@ func TestMaskFormat(t *testing.T) {
 		t.Error("Mask(\"\") returned an empty string; want an explicit placeholder")
 	}
 }
+
+func TestCredentialsStringMasked(t *testing.T) {
+	creds := Credentials{Access: testAccess, Secret: testSecret, CookieUser: testUser, CookieSig: testSig}
+	got := creds.String()
+	for _, secret := range []string{testAccess, testSecret, testUser, testSig} {
+		if strings.Contains(got, secret) {
+			t.Errorf("Credentials.String() leaks a full secret value %q: %s", secret, got)
+		}
+	}
+	// Masked prefixes must still be present so the output stays useful.
+	for _, want := range []string{"SECR", "TOPS", "logg"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Credentials.String() lacks the masked prefix %q: %s", want, got)
+		}
+	}
+	for _, want := range []string{"s3_access", "s3_secret", "cookie_user", "cookie_sig"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Credentials.String() lacks the field name %q: %s", want, got)
+		}
+	}
+}
+
+func TestSaveToConfigSanitizesScreenname(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wauploader.toml")
+	dirty := "my\nscreen\rname\twith\x00ctrl"
+	creds := Credentials{Access: "A12345678", Secret: "B87654321", CookieUser: "C12345678", CookieSig: "D12345678"}
+	if err := SaveToConfig(path, creds, dirty); err != nil {
+		t.Fatalf("SaveToConfig returned error: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var commentLine string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "# Аккаунт archive.org: ") {
+			commentLine = line
+			break
+		}
+	}
+	want := "# Аккаунт archive.org: myscreennamewithctrl"
+	if commentLine != want {
+		t.Errorf("screenname comment = %q, want sanitized %q", commentLine, want)
+	}
+	if _, err := config.Load(path); err != nil {
+		t.Errorf("config.Load after sanitized comment: %v", err)
+	}
+}
+
+func TestBootstrapRefusalNon2xxNotInterpreted(t *testing.T) {
+	overridePause(t, 0)
+	// A cached 502 page that happens to carry a refusal-shaped body must
+	// never be read as "неверный пароль": the envelope is only trusted on 2xx.
+	fakeXauthn(t, http.StatusBadGateway, `{"success": false, "values": {"reason": "account_bad_password"}}`)
+
+	_, err := Bootstrap(context.Background(), newTestClient(t), testEmail, testPassword)
+	if err == nil {
+		t.Fatal("Bootstrap returned nil error for a 502 refusal-shaped body, want error")
+	}
+	if strings.Contains(err.Error(), "неверный пароль") {
+		t.Errorf("502 body was interpreted as a credential refusal: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error %q does not mention the HTTP status 502", err.Error())
+	}
+	if !strings.Contains(err.Error(), `"success": false`) {
+		t.Errorf("error %q does not surface the raw body", err.Error())
+	}
+}
