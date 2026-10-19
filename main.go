@@ -3,43 +3,50 @@
 package main
 
 import (
+	"errors"
 	"os"
 
 	"github.com/4q4r/wauploader/internal/commands"
-	"github.com/4q4r/wauploader/internal/version"
+	"github.com/4q4r/wauploader/internal/console"
 	"github.com/spf13/cobra"
 )
 
-// cliFlags carries the global persistent flag values. Grouped in a struct so
-// command constructors take explicit state; configuration and console layers
-// (later tasks) consume it.
+// cliFlags carries the global persistent flag values. Grouped in a struct
+// so command constructors take explicit state.
 type cliFlags struct {
-	configPath string
-	jsonOutput bool
-	noColor    bool
+	configPath  string
+	journalPath string
+	jsonOutput  bool
+	noColor     bool
+	dryRun      bool
 }
 
 var flags cliFlags
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
+		var ee *commands.ExitError
+		if errors.As(err, &ee) {
+			// A nil Err means the failure was already reported per-event
+			// (summary-based exits); otherwise print the Russian text.
+			if ee.Err != nil {
+				printCLIError(ee.Err)
+			}
+			os.Exit(ee.Code)
+		}
+		printCLIError(err)
 		os.Exit(1)
 	}
 }
 
-func newRootCommand() *cobra.Command {
-	root := &cobra.Command{
-		Use:   version.Name,
-		Short: "Save pages to web.archive.org and upload files to archive.org items",
-	}
-	root.PersistentFlags().StringVar(&flags.configPath, "config",
-		"~/.config/wauploader/wauploader.toml", "path to the configuration file")
-	root.PersistentFlags().BoolVar(&flags.jsonOutput, "json", false,
-		"emit machine-readable JSON output")
-	root.PersistentFlags().BoolVar(&flags.noColor, "no-color", false,
-		"disable colored terminal output")
+// printCLIError reports a failed command through the console (glyphed,
+// color-gated) so cobra's English "Error:" prefix never reaches the user.
+func printCLIError(err error) {
+	con := console.New(os.Stderr, os.Stderr, console.IsTTY(os.Stderr), flags.noColor)
+	con.Errorf("%v", err)
+}
 
-	root.AddCommand(version.NewVersionCommand(&flags.jsonOutput))
-	root.AddCommand(commands.NewInitCommand(&flags.configPath, &flags.jsonOutput, &flags.noColor))
-	return root
+func newRootCommand() *cobra.Command {
+	return commands.NewRootCommand(&flags.configPath, &flags.journalPath,
+		&flags.jsonOutput, &flags.noColor, &flags.dryRun)
 }

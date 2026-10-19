@@ -359,6 +359,29 @@ func (s *Store) UpdateState(kind Kind, target string, st State, mutate func(*Rec
 // in states — the resume scan. A nil/empty kinds list means both kinds; a
 // nil/empty states list means all states. Records come back as copies, safe
 // outside the transaction.
+// Delete removes the record stored for kind+target and reports whether a
+// record existed. Added for the `jobs --clear` surface (Task 12): no other
+// mutation surface changed.
+func (s *Store) Delete(kind Kind, target string) (bool, error) {
+	if err := validateKind(kind); err != nil {
+		return false, err
+	}
+	key := KeyFor(kind, target)
+	var existed bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNames[kind])
+		if b == nil {
+			return fmt.Errorf("секция журнала %q отсутствует", bucketNames[kind])
+		}
+		existed = b.Get([]byte(key)) != nil
+		return b.Delete([]byte(key))
+	})
+	if err != nil {
+		return false, err
+	}
+	return existed, nil
+}
+
 func (s *Store) ByStates(kinds []Kind, states []State) ([]Record, error) {
 	kindList, err := resolveKinds(kinds)
 	if err != nil {
