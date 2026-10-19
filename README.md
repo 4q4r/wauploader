@@ -248,6 +248,9 @@ flowchart TB
 
 ```text
 wauploader/
+├── go.mod                   # модуль github.com/4q4r/wauploader, Go 1.27
+├── go.sum                   # контрольные суммы зависимостей
+├── LICENSE                  # MIT
 ├── main.go                  # вход: ExitError → коды выхода 0/1/2/3
 ├── Makefile                 # build · fmt · vet · lint · test · vuln · gate
 ├── .golangci.yml            # v2-конфиг линтера (см. docs/lint.md)
