@@ -1,0 +1,18 @@
+{
+  "status": "success",
+  "job_id": "ac58789b-f3ca-48d0-9ea6-1d1225e98695",
+  "original_url": "http://brewster.kahle.org/",
+  "timestamp": "20200101010101",
+  "duration_sec": 12.3,
+  "resources": [
+    "http://brewster.kahle.org/",
+    "https://archive.org/images/logo.png"
+  ],
+  "outlinks": {
+    "https://archive.org/": "spn2-0123456789abcdef0123456789abcdef12345678",
+    "https://help.archive.org/": "spn2-ffffffffffffffffffffffffffffffffffffffff"
+  },
+  "screenshot": "http://web.archive.org/screenshot/http://brewster.kahle.org/",
+  "first_archive": true,
+  "http_status": 200
+}

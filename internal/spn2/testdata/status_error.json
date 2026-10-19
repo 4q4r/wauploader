@@ -1,0 +1,7 @@
+{
+  "status": "error",
+  "job_id": "dd1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8",
+  "status_ext": "error:invalid-host-resolution",
+  "message": "Cannot resolve host nxdomain.fake.tld.",
+  "exception": "requests.exceptions.ConnectionError: nxdomain.fake.tld"
+}
