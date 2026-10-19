@@ -87,7 +87,8 @@ func TestUploadAutoMetaFlagContract(t *testing.T) {
 }
 
 // TestUploadAutoMetaBadFilename: a file outside the NN_author_topic
-// convention fails with the Russian convention error (exit 2).
+// convention is a DATA error of the file set, not CLI misuse — exit 1 with
+// the Russian convention error (review ruling, fix round 1).
 func TestUploadAutoMetaBadFilename(t *testing.T) {
 	newFakeBackend(t)
 	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
@@ -97,13 +98,14 @@ func TestUploadAutoMetaBadFilename(t *testing.T) {
 
 	r := runRoot(t, "--config", cfg, "upload", "--auto-meta", "--identifier-scheme", "dir-nn-slug",
 		"--collection", "opensource_texts", "--mediatype", "texts", file)
-	require.Equal(t, ExitUsage, r.code)
+	require.Equal(t, ExitSomeFailed, r.code, "out=%s errOut=%s", r.out, r.errOut)
 	require.Contains(t, r.errOut, "chapter_one.pdf")
 	require.Contains(t, r.errOut, "NN_автор_тема")
 }
 
 // TestUploadAutoMetaDryRunPlan: dry-run prints the full derived plan
-// (identifier, title, collection, language) and touches no network.
+// (identifier, title, author, collection, language, subjects, description
+// head) and touches no network — the owner's complete pre-ship surface.
 func TestUploadAutoMetaDryRunPlan(t *testing.T) {
 	fb := newFakeBackend(t)
 	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
@@ -117,8 +119,34 @@ func TestUploadAutoMetaDryRunPlan(t *testing.T) {
 	require.Contains(t, r.out, "Derived Title From PDF")
 	require.Contains(t, r.out, "opensource_texts")
 	require.Contains(t, r.out, "eng")
+	require.Contains(t, r.out, "Автор: test, PDF Author", "creator must be on the review surface")
+	require.Contains(t, r.out, "Темы: athens, author topic", "subjects must be on the review surface")
+	require.Contains(t, r.out, "Описание: The first page text with ascii dominance.", "a description head must be shown")
 	require.Contains(t, r.out, "Итог dry-run")
 	require.Empty(t, fb.requests(), "dry-run must not issue any HTTP request")
+}
+
+// TestUploadAutoMetaDuplicateIdentifiers: two filenames mapping to one
+// derived identifier (01_x.pdf and 1_x.pdf) would silently merge items —
+// the batch fails with exit 2 naming the collision.
+func TestUploadAutoMetaDuplicateIdentifiers(t *testing.T) {
+	newFakeBackend(t)
+	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
+	cfg := writeTestConfig(t, testConfigFull)
+	dir := filepath.Join(t.TempDir(), "athens")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+
+	a := filepath.Join(dir, "01_x_topic.pdf")
+	b := filepath.Join(dir, "1_x_topic.pdf")
+	require.NoError(t, os.WriteFile(a, []byte("x"), 0o600))
+	require.NoError(t, os.WriteFile(b, []byte("y"), 0o600))
+
+	r := runRoot(t, "--config", cfg, "upload", "--auto-meta", "--identifier-scheme", "dir-nn-slug",
+		"--collection", "opensource_texts", "--mediatype", "texts", "--dry-run", a, b)
+	require.Equal(t, ExitUsage, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.errOut, "athens-1-x-topic", "both files derive the same identifier")
+	require.Contains(t, r.errOut, "01_x_topic.pdf")
+	require.Contains(t, r.errOut, "1_x_topic.pdf")
 }
 
 // TestUploadAutoMetaFullRun: the derived metadata rides the PUT —

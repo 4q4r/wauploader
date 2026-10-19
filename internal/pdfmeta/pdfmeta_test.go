@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/4q4r/wauploader/internal/ias3"
 	"github.com/stretchr/testify/require"
@@ -75,13 +76,41 @@ func TestExtractRecordsCommandLine(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "args.txt")
 	writeScript(t, dir, "pdfinfo", "printf '%s\\n' \"$@\" > "+record+"\n")
+	writeScript(t, dir, "pdftotext", "printf '%s\\n' \"$@\" >> "+record+"\n")
 	overrideBins(t, filepath.Join(dir, "pdfinfo"), filepath.Join(dir, "pdftotext"))
 
 	_, err := Extract("/docs/paper.pdf")
 	require.NoError(t, err)
+	text, err := FirstPageText("/docs/paper.pdf", 10)
+	require.NoError(t, err)
+	_ = text
+
 	b, err := os.ReadFile(record)
 	require.NoError(t, err)
-	require.Equal(t, "-isodates\n/docs/paper.pdf\n", string(b))
+	require.Equal(t, "-isodates\n/docs/paper.pdf\n-f\n1\n-l\n1\n/docs/paper.pdf\n-\n", string(b),
+		"both poppler arg contracts are pinned")
+}
+
+// A pathological PDF must not hang the batch: the poppler binaries run
+// under BinTimeout and a deadline breach fails the file in Russian.
+func TestPopplerBinaryDeadlineFailsInRussian(t *testing.T) {
+	dir := t.TempDir()
+	// `exec` makes sleep the DIRECT child so CommandContext's kill lands
+	// on the sleeper itself, not on a shell wrapper holding the pipe.
+	writeScript(t, dir, "pdfinfo", "exec sleep 30\n")
+	writeScript(t, dir, "pdftotext", "")
+	overrideBins(t, filepath.Join(dir, "pdfinfo"), filepath.Join(dir, "pdftotext"))
+
+	old := BinTimeout
+	BinTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { BinTimeout = old })
+
+	start := time.Now()
+	_, err := Extract("/docs/huge.pdf")
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 10*time.Second, "the deadline must kill the hung binary")
+	require.Contains(t, err.Error(), "не ответил за")
+	require.Contains(t, err.Error(), "/docs/huge.pdf")
 }
 
 func TestExtractBinaryFailureMentionsPath(t *testing.T) {
@@ -188,6 +217,24 @@ func TestDeriveMetaLanguageRus(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "rus", m.Language)
 	require.Equal(t, "2015", m.Year)
+}
+
+// The language window is the FULL first page, not the 500-char description
+// budget: a Russian paper opening with a long English abstract must not be
+// tagged eng off its title page alone.
+func TestDeriveMetaLanguageRusAfterLongEnglishAbstract(t *testing.T) {
+	abstract := strings.Repeat("This is an english abstract sentence. ", 16) // ~620 chars, ascii
+	body := strings.Repeat("Аристофан и афинская культура в древней комедии города. ", 6)
+	require.Greater(t, len([]rune(abstract)), 500, "precondition: the abstract alone exceeds the old 500-char window")
+	fakePair(t, "Title:          Тест\nPages:          3\n", abstract+body)
+	dir := t.TempDir()
+	path := touch(t, dir, "01_ivanov_komedia.pdf")
+
+	m, err := DeriveMeta(path, "athens")
+	require.NoError(t, err)
+	require.Equal(t, "rus", m.Language, "the Russian body must win over the English front matter")
+	// The description budget is unchanged: capped at 500 runes of the head.
+	require.LessOrEqual(t, len([]rune(m.Description)), 500)
 }
 
 func TestDeriveMetaLanguageOmittedWhenMixed(t *testing.T) {

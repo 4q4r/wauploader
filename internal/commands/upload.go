@@ -168,11 +168,20 @@ func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTar
 }
 
 // deriveAutoMetaTargets derives targets and metadata from the PDFs and
-// announces each derived identifier + title in human-readable mode.
+// announces each derived identifier + title in human-readable mode. The
+// returned error is already exit-classified: duplicate identifiers are a
+// usage error (exit 2 — silent item-merge is worse), while convention and
+// poppler failures are data errors of the file set (exit 1, review ruling
+// of fix round 1).
 func deriveAutoMetaTargets(con *console.Console, paths []string, jsonOut bool) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
 	targets, metas, err := uploadAutoMetaTargets(paths)
 	if err != nil {
-		return nil, nil, err
+		var dup *duplicateIdentifierError
+		if errors.As(err, &dup) {
+			return nil, nil, exitUsage("%v", err)
+		}
+
+		return nil, nil, &ExitError{Code: ExitSomeFailed, Err: err}
 	}
 
 	if !jsonOut {
@@ -184,6 +193,60 @@ func deriveAutoMetaTargets(con *console.Console, paths []string, jsonOut bool) (
 	return targets, metas, nil
 }
 
+// duplicateIdentifierError marks an --auto-meta batch whose files collide
+// on one derived identifier — uploading it would silently merge items.
+type duplicateIdentifierError struct {
+	Identifier string
+	First      string
+	Second     string
+}
+
+func (e *duplicateIdentifierError) Error() string {
+	return "повторяющийся идентификатор «" + e.Identifier + "»: элементы сольются — " +
+		e.First + " и " + e.Second + "; переименуйте один из файлов"
+}
+
+// printDryRunDetail renders one file's complete derived plan for the
+// dry-run review surface: title, creator, collection, language, year,
+// subjects and a description head.
+func printDryRunDetail(con *console.Console, meta pdfmeta.Meta, collection string) {
+	detail := "Название: «" + meta.Title + "»"
+	if meta.Creator != "" {
+		detail += " · Автор: " + meta.Creator
+	}
+
+	detail += " · Коллекция: " + collection
+
+	if meta.Language != "" {
+		detail += " · Язык: " + meta.Language
+	}
+
+	if meta.Year != "" {
+		detail += " · Год: " + meta.Year
+	}
+
+	if len(meta.Subjects) > 0 {
+		detail += " · Темы: " + strings.Join(meta.Subjects, ", ")
+	}
+
+	con.Dimf("    %s", detail)
+
+	if head := descriptionHead(meta.Description); head != "" {
+		con.Dimf("    Описание: %s", head)
+	}
+}
+
+// descriptionHead cuts the derived description to a 60-char preview head
+// for the dry-run plan line (ellipsis marks the cut).
+func descriptionHead(d string) string {
+	head := d
+	if len([]rune(d)) > 60 {
+		head = string([]rune(d)[:60]) + "…"
+	}
+
+	return strings.TrimRight(head, " ")
+}
+
 // uploadAutoMetaTargets derives the targets and item metadata from the
 // PDFs themselves: pdfmeta.DeriveMeta for the metadata, pdfmeta.Identifier
 // for the dir-nn-slug scheme. Subjects/language/year land in the per-target
@@ -191,6 +254,7 @@ func deriveAutoMetaTargets(con *console.Console, paths []string, jsonOut bool) (
 func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
 	targets := make([]runner.UploadTarget, 0, len(paths))
 	metas := make([]pdfmeta.Meta, 0, len(paths))
+	seenIDs := make(map[string]string, len(paths)) // identifier → first path
 
 	for _, p := range paths {
 		abs, err := filepath.Abs(p)
@@ -209,6 +273,12 @@ func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Met
 		if err != nil {
 			return nil, nil, err
 		}
+
+		if prev, seen := seenIDs[id]; seen {
+			return nil, nil, &duplicateIdentifierError{Identifier: id, First: prev, Second: abs}
+		}
+
+		seenIDs[id] = abs
 
 		extra := ias3.Meta{}
 		if len(meta.Subjects) > 0 {
@@ -384,7 +454,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	if f.autoMeta {
 		targets, derived, err = deriveAutoMetaTargets(con, rawPaths, jsonOut)
 		if err != nil {
-			return exitUsage("%v", err)
+			return err
 		}
 	}
 
@@ -474,16 +544,7 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 		con.Infof("Загрузить: %s → %s/%s", t.Path, t.Identifier, t.Key)
 
 		if idx < len(derived) {
-			detail := "Название: «" + derived[idx].Title + "» · Коллекция: " + collection
-			if derived[idx].Language != "" {
-				detail += " · Язык: " + derived[idx].Language
-			}
-
-			if derived[idx].Year != "" {
-				detail += " · Год: " + derived[idx].Year
-			}
-
-			con.Dimf("    %s", detail)
+			printDryRunDetail(con, derived[idx], collection)
 		}
 	}
 

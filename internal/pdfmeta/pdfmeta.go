@@ -16,23 +16,28 @@ package pdfmeta
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/4q4r/wauploader/internal/ias3"
 )
 
-// PDFInfoBin and PdftotextBin are the external poppler-utils binaries;
-// package variables so tests can substitute fake scripts.
+// PDFInfoBin, PdftotextBin and BinTimeout are the external poppler-utils
+// surfaces; package variables so tests can substitute fake scripts and a
+// shrunk deadline.
 var (
 	PDFInfoBin   = "pdfinfo"
 	PdftotextBin = "pdftotext"
+	BinTimeout   = 60 * time.Second
 )
 
 // descriptionMaxChars is the first-page text budget for the item
@@ -68,7 +73,7 @@ var numberPrefixRe = regexp.MustCompile(`^(\d+)`)
 
 // Extract reads the document info of one PDF through `pdfinfo -isodates`.
 func Extract(path string) (Info, error) {
-	out, err := runBin(PDFInfoBin, []string{"-isodates", path})
+	out, err := runBin(PDFInfoBin, path, []string{"-isodates", path})
 	if err != nil {
 		return Info{}, fmt.Errorf("не удалось прочитать метаданные PDF %s через pdfinfo: %w", path, err)
 	}
@@ -105,21 +110,43 @@ func parsePDFInfo(out string) Info {
 // `pdftotext -f 1 -l 1 <path> -`, sanitized: control characters stripped,
 // whitespace runs collapsed to single spaces, capped at maxChars runes.
 func FirstPageText(path string, maxChars int) (string, error) {
-	out, err := runBin(PdftotextBin, []string{"-f", "1", "-l", "1", path, "-"})
+	full, err := firstPageText(path)
+	if err != nil {
+		return "", err
+	}
+
+	return truncateRunes(full, maxChars), nil
+}
+
+// firstPageText returns the FULL sanitized first-page text. The language
+// heuristic consumes all of it; only the description is truncated (a
+// 500-char window would misread a Russian paper opening with a long
+// English abstract).
+func firstPageText(path string) (string, error) {
+	out, err := runBin(PdftotextBin, path, []string{"-f", "1", "-l", "1", path, "-"})
 	if err != nil {
 		return "", fmt.Errorf("не удалось извлечь текст первой страницы %s через pdftotext: %w", path, err)
 	}
 
-	return truncateRunes(sanitizeText(string(out)), maxChars), nil
+	return sanitizeText(string(out)), nil
 }
 
-// runBin executes name with args and returns stdout; a non-zero exit or a
-// missing binary is an error carrying the binary name and its stderr.
-func runBin(name string, args []string) ([]byte, error) {
+// runBin executes name with args against path and returns stdout. A
+// non-zero exit or a missing binary is an error carrying the binary name
+// and its stderr; a deadline breach (BinTimeout) kills the process and
+// fails in Russian — a pathological PDF must never hang the batch. The
+// C locale is forced so pdfinfo output stays parser-stable regardless of
+// the machine's localization.
+func runBin(name, path string, args []string) ([]byte, error) {
 	// The exported surface is synchronous by design (the CLI has no
 	// cancellation shorter than the whole batch), so the background
-	// context is the honest lifetime here.
-	cmd := exec.CommandContext(context.Background(), name, args...)
+	// context is the honest lifetime; the deadline is the real guard.
+	ctx, cancel := context.WithTimeout(context.Background(), BinTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 
 	var stderr strings.Builder
 
@@ -127,6 +154,10 @@ func runBin(name string, args []string) ([]byte, error) {
 
 	out, err := cmd.Output()
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, fmt.Errorf("%s не ответил за %v — файл %s", name, BinTimeout, path)
+		}
+
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			return nil, fmt.Errorf("%s: %w", name, err)
@@ -215,7 +246,7 @@ func DeriveMeta(path string, dirName string) (Meta, error) {
 		return Meta{}, err
 	}
 
-	text, err := FirstPageText(path, descriptionMaxChars)
+	full, err := firstPageText(path)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -229,9 +260,9 @@ func DeriveMeta(path string, dirName string) (Meta, error) {
 		Title:       title,
 		Creator:     joinCreators(author, info.Author),
 		Year:        extractYear(info.CreationDate),
-		Description: text,
+		Description: truncateRunes(full, descriptionMaxChars),
 		Subjects:    append([]string{dirName}, strings.Join(topicWords, " ")),
-		Language:    DetectLanguage(text),
+		Language:    DetectLanguage(full),
 	}
 
 	if m.Subjects[1] == "" {
