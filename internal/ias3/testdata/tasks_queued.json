@@ -1,0 +1,10 @@
+{
+  "success": true,
+  "value": {
+    "summary": {"queued": 1, "running": 0, "error": 0, "paused": 0},
+    "catalog": [
+      {"task_id": 101, "cmd": "derive.php", "wait_admin": 0, "submitter": "uploader@example.com", "priority": 0}
+    ],
+    "history": []
+  }
+}
