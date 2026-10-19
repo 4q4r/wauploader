@@ -3,20 +3,22 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/4q4r/wauploader/internal/version"
 	"github.com/spf13/cobra"
 )
 
-// Global persistent flag values. Declared here so the CLI surface exists;
-// configuration and console layers (later tasks) consume them.
-var (
+// cliFlags carries the global persistent flag values. Grouped in a struct so
+// command constructors take explicit state; configuration and console layers
+// (later tasks) consume it.
+type cliFlags struct {
 	configPath string
 	jsonOutput bool
 	noColor    bool
-)
+}
+
+var flags cliFlags
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -29,25 +31,13 @@ func newRootCommand() *cobra.Command {
 		Use:   version.Name,
 		Short: "Save pages to web.archive.org and upload files to archive.org items",
 	}
-	root.PersistentFlags().StringVar(&configPath, "config",
+	root.PersistentFlags().StringVar(&flags.configPath, "config",
 		"~/.config/wauploader/wauploader.toml", "path to the configuration file")
-	root.PersistentFlags().BoolVar(&jsonOutput, "json", false,
+	root.PersistentFlags().BoolVar(&flags.jsonOutput, "json", false,
 		"emit machine-readable JSON output")
-	root.PersistentFlags().BoolVar(&noColor, "no-color", false,
+	root.PersistentFlags().BoolVar(&flags.noColor, "no-color", false,
 		"disable colored terminal output")
 
-	root.AddCommand(newVersionCommand())
+	root.AddCommand(version.NewVersionCommand(&flags.jsonOutput))
 	return root
-}
-
-func newVersionCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "version",
-		Short: "Print the wauploader version",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			fmt.Printf("%s version %s\n", version.Name, version.Version)
-			return nil
-		},
-	}
 }
