@@ -1,3 +1,13 @@
+# Go build and test artifacts
+*.exe
+*.test
+*.out
+
+# Project binary
 wauploader
+
+# bbolt journal files
 *.bbolt
+
+# SDD scratch
 .superpowers/
