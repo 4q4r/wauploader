@@ -152,6 +152,75 @@ func TestInitKeysWithoutCookiesSavesAndWarns(t *testing.T) {
 	}
 }
 
+// TestInitJSONRedirectPurity: with --json and a redirected out, the out
+// stream must be ONE parseable JSON object — email/password prompts, the
+// post-password newline, and the progress line go to errOut instead.
+func TestInitJSONRedirectPurity(t *testing.T) {
+	overrideBootstrap(t, auth.Credentials{
+		Access: "ACCESS12345678", Secret: "SECRET87654321",
+		CookieUser: "COOKIEUSER123456", CookieSig: "COOKIESIG123456",
+	}, nil)
+	overrideReadPassword(t, "pw")
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "")
+
+	var out, errOut strings.Builder
+	cfgPath := filepath.Join(t.TempDir(), "wauploader.toml")
+	if err := runInit(cfgPath, true, false, stdinWithEmail(t, "user@example.com"), true, &out, &errOut); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &payload); err != nil {
+		t.Fatalf("redirected --json out is not a pure JSON object: %v\nout=%q", err, out.String())
+	}
+	if payload["event"] != "init" || payload["status"] != "ok" {
+		t.Errorf("JSON payload = %v, want event=init status=ok", payload)
+	}
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Errorf("config not saved: %v", err)
+	}
+
+	for _, want := range []string{
+		"Адрес электронной почты archive.org: ",
+		"Пароль (ввод не отображается): ",
+		"Выполняется вход",
+	} {
+		if !strings.Contains(errOut.String(), want) {
+			t.Errorf("prompt/progress %q missing from errOut:\n%s", want, errOut.String())
+		}
+		if strings.Contains(out.String(), want) {
+			t.Errorf("prompt/progress %q contaminated the JSON out stream:\n%s", want, out.String())
+		}
+	}
+}
+
+// TestInitNoANSIWhenOutRedirected: the TTY state that gates color comes
+// from the OUT stream, not stdin. With stdin on a terminal but out
+// redirected, neither stream may contain ANSI escape sequences even with
+// colors enabled.
+func TestInitNoANSIWhenOutRedirected(t *testing.T) {
+	overrideBootstrap(t, auth.Credentials{
+		Access: "ACCESS12345678", Secret: "SECRET87654321",
+		CookieUser: "COOKIEUSER123456", CookieSig: "COOKIESIG123456",
+	}, nil)
+	overrideReadPassword(t, "pw")
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "")
+
+	var out, errOut strings.Builder
+	// stdinTTY=true (interactive stdin), out is a Builder — redirected.
+	if err := runInit(filepath.Join(t.TempDir(), "wauploader.toml"), false, false,
+		stdinWithEmail(t, "user@example.com"), true, &out, &errOut); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	for name, s := range map[string]string{"out": out.String(), "errOut": errOut.String()} {
+		if strings.Contains(s, "\x1b[") {
+			t.Errorf("%s contains ANSI escapes despite out being redirected:\n%q", name, s)
+		}
+	}
+}
+
 // The init success surface shows masks (first 4 chars + length), never the
 // full secret values, in both human and JSON modes.
 func TestSecretsNeverLogged(t *testing.T) {

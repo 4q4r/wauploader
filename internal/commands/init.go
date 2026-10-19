@@ -72,21 +72,31 @@ var (
 
 // runInit drives the interactive bootstrap. stdin must be the process's
 // terminal file for the no-echo password read; stdinTTY reports whether it
-// is one. With a non-terminal stdin it fails fast with nonTTYHint — the
-// non-interactive path never prompts. out/errOut are injectable for tests.
+// is one and gates interactivity only. Color decisions follow the OUT
+// stream: outTTY is computed from out when it is an *os.File, so a
+// redirected out (wauploader init --json > result.json) never receives
+// ANSI, even on an interactive stdin. Prompts and progress go to errOut,
+// keeping out byte-pure for --json consumers. out/errOut are injectable
+// for tests.
 func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY bool, out, errOut io.Writer) error {
 	if !stdinTTY || stdin == nil {
 		return nonTTYHint(cfgPath)
 	}
-	con := console.New(out, errOut, stdinTTY, noColor)
+	var outTTY bool
+	if f, ok := out.(*os.File); ok {
+		outTTY = console.IsTTY(f)
+	}
+	// The prompt/progress console writes to errOut as well: its out-bound
+	// lines (Infof) must never contaminate the machine-readable out stream.
+	con := console.New(errOut, errOut, outTTY, noColor)
 
-	email, err := promptLine(stdin, out, "Адрес электронной почты archive.org: ")
+	email, err := promptLine(stdin, errOut, "Адрес электронной почты archive.org: ")
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(out, "Пароль (ввод не отображается): ")
+	fmt.Fprint(errOut, "Пароль (ввод не отображается): ")
 	raw, err := readPasswordFn(stdin)
-	fmt.Fprintln(out)
+	fmt.Fprintln(errOut)
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать пароль: %w", err)
 	}
@@ -114,7 +124,7 @@ func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY boo
 	if err := auth.SaveToConfig(savePath, creds, ""); err != nil {
 		return err
 	}
-	writeInitSuccess(out, errOut, stdinTTY, noColor, jsonOut, savePath, warnCookies, creds)
+	writeInitSuccess(out, errOut, outTTY, noColor, jsonOut, savePath, warnCookies, creds)
 	return nil
 }
 
@@ -146,12 +156,13 @@ func expandHomePath(p string) string {
 }
 
 // writeInitSuccess reports the saved credentials with masked values only:
-// first 4 characters plus length, in both human and JSON modes. When
-// warnCookies is set (login returned keys without cookies), the human
-// surface gains a warning line and the JSON object a "warning" field —
-// both carry auth.ErrCookiesNotReturned's Russian text.
-func writeInitSuccess(out, errOut io.Writer, isTTY, noColor, jsonOut bool, cfgPath string, warnCookies bool, c auth.Credentials) {
-	con := console.New(out, errOut, isTTY, noColor)
+// first 4 characters plus length, in both human and JSON modes. outTTY is
+// the OUT stream's terminal state (color gate). When warnCookies is set
+// (login returned keys without cookies), the human surface gains a warning
+// line and the JSON object a "warning" field — both carry
+// auth.ErrCookiesNotReturned's Russian text.
+func writeInitSuccess(out, errOut io.Writer, outTTY, noColor, jsonOut bool, cfgPath string, warnCookies bool, c auth.Credentials) {
+	con := console.New(out, errOut, outTTY, noColor)
 	if jsonOut {
 		payload := map[string]any{
 			"event":  "init",
