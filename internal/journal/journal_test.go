@@ -338,6 +338,79 @@ func TestPutValidatesKindAndState(t *testing.T) {
 	assert.Contains(t, err.Error(), "неизвестное состояние")
 }
 
+// TestUpdateStateMutateRevalidation pins the re-validation contract: a mutate
+// hook may not persist an invalid state, flip the record's kind, or change the
+// derived key — the record must stay unchanged on re-read.
+func TestUpdateStateMutateRevalidation(t *testing.T) {
+	cases := []struct {
+		name     string
+		wantErr  string
+		mutate   func(*Record)
+		wantKeep State // state expected on re-read after the rejected mutate
+	}{
+		{
+			name:     "invalid_state_rejected",
+			wantErr:  "неизвестное состояние",
+			mutate:   func(r *Record) { r.State = "broken" },
+			wantKeep: StateQueued,
+		},
+		{
+			name:     "kind_flip_rejected",
+			wantErr:  "изменение типа записи запрещено",
+			mutate:   func(r *Record) { r.Kind = KindUpload },
+			wantKeep: StateQueued,
+		},
+		{
+			name:     "key_change_rejected",
+			wantErr:  "изменение ключа записи запрещено",
+			mutate:   func(r *Record) { r.Key = "deadbeef" },
+			wantKeep: StateQueued,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openTestStore(t)
+			defer store.Close()
+
+			target := "https://example.com/revalidate-" + tc.name
+			require.NoError(t, store.Put(testRecord(KindSave, target)))
+
+			err := store.UpdateState(KindSave, target, StateDone, tc.mutate)
+			require.Error(t, err, "mutate must be re-validated before persist")
+			assert.Contains(t, err.Error(), tc.wantErr)
+
+			got, found, err := store.Get(KindSave, target)
+			require.NoError(t, err)
+			require.True(t, found, "record must still exist")
+			assert.Equal(t, tc.wantKeep, got.State, "record must be unchanged after rejected mutate")
+			assert.Equal(t, KindSave, got.Kind)
+			assert.Equal(t, KeyFor(KindSave, target), got.Key)
+		})
+	}
+}
+
+// TestPutDoesNotMutateCaller pins Put purity: the caller's record is never
+// written to; derived fields stay zero in the caller's copy.
+func TestPutDoesNotMutateCaller(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	r := testRecord(KindSave, "https://example.com/pure-put")
+	require.NoError(t, store.Put(r))
+
+	assert.Empty(t, r.Key, "Put must not write Key back into the caller's record")
+	assert.True(t, r.UpdatedAt.IsZero(), "Put must not stamp UpdatedAt in the caller's record")
+	assert.Zero(t, r.SchemaVersion, "Put must not set SchemaVersion in the caller's record")
+
+	// The stored copy still carries the derived values.
+	got, found, err := store.Get(KindSave, "https://example.com/pure-put")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, KeyFor(KindSave, "https://example.com/pure-put"), got.Key)
+	assert.Equal(t, uint8(1), got.SchemaVersion)
+	assert.False(t, got.UpdatedAt.IsZero())
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "journal.bbolt"))

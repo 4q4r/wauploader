@@ -141,7 +141,7 @@ func Open(path string) (*Store, error) {
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range bucketNames {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
-				return fmt.Errorf("create bucket %q: %w", name, err)
+				return fmt.Errorf("не удалось создать секцию журнала %q: %w", name, err)
 			}
 		}
 		return nil
@@ -240,7 +240,8 @@ func decodeRecord(val []byte) (*Record, error) {
 }
 
 // Put stores r under its derived key, forcing the schema version and the
-// UpdatedAt stamp. Kind and State are validated fail-fast.
+// UpdatedAt stamp on the STORED copy — the caller's record is never written
+// to. Kind and State are validated fail-fast.
 func (s *Store) Put(r *Record) error {
 	if err := validateKind(r.Kind); err != nil {
 		return err
@@ -248,22 +249,23 @@ func (s *Store) Put(r *Record) error {
 	if err := validateState(r.State); err != nil {
 		return err
 	}
-	r.Key = KeyFor(r.Kind, r.Target)
-	if r.UpdatedAt.IsZero() {
-		r.UpdatedAt = time.Now()
+	stored := *r
+	stored.Key = KeyFor(stored.Kind, stored.Target)
+	if stored.UpdatedAt.IsZero() {
+		stored.UpdatedAt = time.Now()
 	}
-	r.SchemaVersion = schemaVersion
+	stored.SchemaVersion = schemaVersion
 
 	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketNames[r.Kind])
+		b := tx.Bucket(bucketNames[stored.Kind])
 		if b == nil {
-			return fmt.Errorf("журнал: отсутствует бакет %q", r.Kind)
+			return fmt.Errorf("журнал: отсутствует бакет %q", stored.Kind)
 		}
-		encoded, err := encodeRecord(r)
+		encoded, err := encodeRecord(&stored)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(r.Key), encoded)
+		return b.Put([]byte(stored.Key), encoded)
 	})
 }
 
@@ -329,7 +331,20 @@ func (s *Store) UpdateState(kind Kind, target string, st State, mutate func(*Rec
 		if mutate != nil {
 			mutate(rec)
 		}
-		rec.Key = string(key)
+		// Re-validate after the hook: a mutate may not persist an invalid
+		// state, flip the kind (bucket misfiling), or change the key.
+		if err := validateState(rec.State); err != nil {
+			return err
+		}
+		if err := validateKind(rec.Kind); err != nil {
+			return err
+		}
+		if rec.Kind != kind {
+			return fmt.Errorf("изменение типа записи запрещено (тип %s): %s", kind, target)
+		}
+		if rec.Key != string(key) {
+			return fmt.Errorf("изменение ключа записи запрещено: %s", target)
+		}
 		rec.UpdatedAt = time.Now()
 		rec.SchemaVersion = schemaVersion
 		encoded, err := encodeRecord(rec)
