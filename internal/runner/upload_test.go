@@ -740,13 +740,74 @@ func TestDeriveWatchNotArmedWhenLastFileSkipped(t *testing.T) {
 	assert.Equal(t, 1, sum.Skipped)
 	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
 	assert.Equal(t, journal.StateSkipped, mustUploadRecord(t, st, tgts[1]).State)
-	assert.Equal(t, 1, f.taskCalls("testid-derivenot2"),
-		"baseline only: the last file skipped, so no derive was queued and no watch may run")
+	assert.Equal(t, 2, f.taskCalls("testid-derivenot2"),
+		"baseline + the skip-guard probe only: the last file skipped, so no derive was queued and no watch may run")
 	for _, ev := range got {
 		if ev.Kind == EventState && ev.Target == "testid-derivenot2" && ev.State == journal.StateFailed {
 			t.Fatalf("item-level failure event must not fire without a queued derive: %+v", ev)
 		}
 	}
+}
+
+// TestSkipGuardTasksActiveUploadsAnyway: a matching remote md5 alone
+// does not justify a skip while the item has active catalog tasks
+// (metadata may be stale during derive/ingest) — the file uploads.
+func TestSkipGuardTasksActiveUploadsAnyway(t *testing.T) {
+	paths := writeUploadFiles(t, "guard-me")
+	sum5 := md5.Sum([]byte("guard-me"))
+	f := newFakeIAS3(t)
+	f.metaFiles["testid-skipguard1"] = []metaEntry{{name: "file1.bin", md5: hex.EncodeToString(sum5[:])}}
+	f.taskFn = func(identifier string, nth int) string {
+		return `{"success":true,"value":{"catalog":[{"task_id":5,"cmd":"derive.php","wait_admin":1}],"history":[]}}`
+	}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-skipguard1")
+	o := uploadOpts()
+	o.QueueDerive = false // the guard is independent of derive watching
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, o, false, true)
+	require.NoError(t, err)
+	assert.Equal(t, 1, sum.Done)
+	assert.Equal(t, 0, sum.Skipped, "an active-task item must not produce a skip")
+	assert.Equal(t, 1, f.puts("file1.bin"), "the file must upload instead of skipping")
+	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
+	noted := false
+	for _, ev := range got {
+		if ev.Kind == EventWait && strings.Contains(ev.ErrMsg, "активны задачи") {
+			noted = true
+		}
+	}
+	assert.True(t, noted, "expected a dim note that the skip was cancelled")
+}
+
+// TestSkipGuardTasksErrorFailsRetryable: an erroring Tasks API makes
+// the skip undecidable — the file fails with the retryable Russian
+// message and no PUT is spent.
+func TestSkipGuardTasksErrorFailsRetryable(t *testing.T) {
+	paths := writeUploadFiles(t, "guard-me")
+	sum5 := md5.Sum([]byte("guard-me"))
+	f := newFakeIAS3(t)
+	f.metaFiles["testid-skipguard2"] = []metaEntry{{name: "file1.bin", md5: hex.EncodeToString(sum5[:])}}
+	f.taskFn = func(identifier string, nth int) string {
+		return `{"success":false,"error":"tasks are unavailable"}`
+	}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-skipguard2")
+	o := uploadOpts()
+	o.QueueDerive = false
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, o, false, true)
+	require.NoError(t, err)
+	assert.Equal(t, 0, f.puts("file1.bin"), "an undecidable skip must not PUT")
+	assert.Equal(t, 1, sum.Failed)
+	assert.Equal(t, journal.StateFailed, mustUploadRecord(t, st, tgts[0]).State)
+	found := false
+	for _, ev := range got {
+		if ev.State == journal.StateFailed && strings.Contains(ev.ErrMsg, "активные задачи") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected the Russian undecidable-skip failure message")
 }
 
 // TestDeriveWatchSurvivesVerifyFailure: a verify failure after a

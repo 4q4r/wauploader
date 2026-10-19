@@ -1,7 +1,7 @@
 // upload.go implements the upload pipeline (docs/plan.md Task 11):
-// targets → hash once → skip-if-exists → check_limit preflight → derive
-// baseline → PUT → optional verify → per-item derive watch, journaled at
-// every transition.
+// targets → hash once → skip-if-exists (guarded by active item tasks) →
+// check_limit preflight → derive baseline → PUT → optional verify →
+// per-item derive watch, journaled at every transition.
 //
 // Load-bearing decisions (documented for Task 12 wiring):
 //
@@ -20,6 +20,12 @@
 //     The digests persist on the queued record, so a resumed run never
 //     re-hashes a file. A local file change between hash and PUT is
 //     rejected by ias3.Upload's size check (fail, not overwrite).
+//   - Skip guard (reference-client semantics, owner ruling 2026-10-19):
+//     a matching remote md5 justifies a skip only while the item has NO
+//     active catalog tasks (any command — derive and ingest alike;
+//     ias3.HasActiveTasks). During derive/ingest the metadata may be
+//     stale, so an active item re-uploads; an erroring Tasks API fails
+//     the file retryable (skip-guard) instead of skipping on doubt.
 //   - Journal state usage for uploads: queued (created, hash persisted
 //     while queued), skipped (proven remote duplicate or already done
 //     in the journal), done, failed. submitted/pending/quota_parked do
@@ -382,7 +388,12 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			}
 		}
 
-		// Stage 2: skip-if-exists by remote MD5.
+		// Stage 2: skip-if-exists by remote MD5 — and only while the
+		// item has no active tasks (reference-client guard): during
+		// derive/ingest the metadata answer may be stale, so a matching
+		// md5 alone does not prove the skip. An erroring Tasks API
+		// makes the skip undecidable — the file fails retryable (the
+		// next run retries it) instead of skipping on doubt.
 		if skipExisting {
 			exists, err := r.cl.FileExistsMatchingMD5(ctx, f.t.Identifier, f.t.Key, f.rec.MD5)
 			if err != nil {
@@ -390,16 +401,27 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				continue
 			}
 			if exists {
-				note := "уже в элементе, пропущен (md5 совпал)"
-				f.rec.ErrKind, f.rec.ErrMsg = "", ""
-				if err := r.persist(f, journal.StateSkipped); err != nil {
-					r.journalError(events, c, f, err)
+				active, err := r.cl.HasActiveTasks(ctx, f.t.Identifier)
+				if err != nil {
+					r.failFile(events, c, f, "skip-guard", fmt.Sprintf("не удалось проверить активные задачи item — пропуск недостоверен: %v", err))
 					continue
 				}
-				c.incSkipped()
-				r.emit(events, Event{Kind: EventState, Target: f.target, State: journal.StateSkipped, ErrMsg: note})
-				r.con.Dimf("Пропущено (уже в элементе, md5 совпал): %s → %s/%s", f.t.Path, f.t.Identifier, f.t.Key)
-				continue
+				if active {
+					note := "в item активны задачи — пропуск отменён, файл будет загружен"
+					r.emit(events, Event{Kind: EventWait, Target: f.target, State: f.rec.State, ErrMsg: note})
+					r.con.Dimf("%s → %s/%s: %s", f.t.Path, f.t.Identifier, f.t.Key, note)
+				} else {
+					note := "уже в элементе, пропущен (md5 совпал)"
+					f.rec.ErrKind, f.rec.ErrMsg = "", ""
+					if err := r.persist(f, journal.StateSkipped); err != nil {
+						r.journalError(events, c, f, err)
+						continue
+					}
+					c.incSkipped()
+					r.emit(events, Event{Kind: EventState, Target: f.target, State: journal.StateSkipped, ErrMsg: note})
+					r.con.Dimf("Пропущено (уже в элементе, md5 совпал): %s → %s/%s", f.t.Path, f.t.Identifier, f.t.Key)
+					continue
+				}
 			}
 		}
 
