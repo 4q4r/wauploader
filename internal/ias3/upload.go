@@ -73,17 +73,23 @@ type Client struct {
 	hc    *httpx.Client
 	creds auth.Credentials
 
-	// base is the endpoint root; S3Base by default. Package-level so the
-	// httptest fakes can repoint it (same override pattern as the auth
-	// endpoint vars; tests run sequentially).
+	// base is the S3 endpoint root; S3Base by default. Package-level so
+	// the httptest fakes can repoint it (same override pattern as the
+	// auth endpoint vars; tests run sequentially).
 	base string
+
+	// webBase is the archive.org host serving the Item Metadata API and
+	// the Tasks API (meta.go) — a DIFFERENT host than base: S3Base for
+	// PUT/CheckLimit, archive.org for /metadata/ and /services/tasks.php.
+	// ArchiveBase by default; same httptest override seam as base.
+	webBase string
 }
 
 // NewClient builds an IA-S3 client over the shared HTTP client. The S3
 // keys are used as-is; key presence is enforced per call (in Russian)
 // because the zero value must stay constructible for tests.
 func NewClient(hc *httpx.Client, creds auth.Credentials) *Client {
-	return &Client{hc: hc, creds: creds, base: S3Base}
+	return &Client{hc: hc, creds: creds, base: S3Base, webBase: ArchiveBase}
 }
 
 // setAuth attaches the IA-S3 Authorization: LOW header (r2 §1.2 — SigV4
