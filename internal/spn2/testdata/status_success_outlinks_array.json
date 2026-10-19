@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "job_id": "be90ba30-8ab0-4a33-8b7c-2ef05ba3fac3",
+  "original_url": "https://example.com/",
+  "timestamp": "20260101020202",
+  "duration_sec": 5.0,
+  "resources": ["https://example.com/"],
+  "outlinks": [
+    "https://example.com/about",
+    "https://example.com/contact"
+  ],
+  "first_archive": false
+}
