@@ -3,6 +3,7 @@
 // filtered records. quota_parked records are always visible here: they are
 // never auto-resumed — requeueing happens by explicitly re-listing the
 // targets in `save` (Task 10/12 ledger ruling).
+
 package commands
 
 import (
@@ -26,26 +27,29 @@ var jobsStateFilter = map[string]journal.State{
 // status results).
 func NewJobsCommand(journalPath *string, noColor *bool) *cobra.Command {
 	var stateArg string
-	var clear bool
+
+	var doClear bool
+
 	cmd := &cobra.Command{
 		Use:          "jobs [--state failed|queued|pending|done] [--clear]",
 		Short:        "Показать записи журнала выполнения; --clear удаляет отфильтрованные записи",
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runJobs(cmd, derefString(journalPath, ""), stateArg, clear, derefBool(noColor))
+			return runJobs(cmd, derefString(journalPath, ""), stateArg, doClear, derefBool(noColor))
 		},
 	}
 	cmd.Flags().StringVar(&stateArg, "state", "",
 		"фильтр по состоянию: failed, queued, pending или done")
-	cmd.Flags().BoolVar(&clear, "clear", false,
+	cmd.Flags().BoolVar(&doClear, "clear", false,
 		"удалить записи, подходящие под фильтр (все, если фильтр не задан)")
+
 	return cmd
 }
 
 // runJobs opens the journal (creating it if absent — it is this command's
 // own domain), lists or clears records.
-func runJobs(cmd *cobra.Command, journalFlag, stateArg string, clear, noColor bool) error {
+func runJobs(cmd *cobra.Command, journalFlag, stateArg string, doClear, noColor bool) error {
 	out := cmd.OutOrStdout()
 	// The listing is one coherent stdout stream: the listing console binds
 	// both of its writers to out, so failed records keep the ✗ glyph
@@ -57,6 +61,7 @@ func runJobs(cmd *cobra.Command, journalFlag, stateArg string, clear, noColor bo
 	if err != nil {
 		return err
 	}
+
 	st, err := journal.Open(jp)
 	if err != nil {
 		return &ExitError{Code: ExitSomeFailed, Err: err}
@@ -64,36 +69,45 @@ func runJobs(cmd *cobra.Command, journalFlag, stateArg string, clear, noColor bo
 	defer st.Close() //nolint:errcheck // read-only after open
 
 	var states []journal.State
+
 	if stateArg != "" {
 		s, ok := jobsStateFilter[stateArg]
 		if !ok {
 			return exitUsage("недопустимое значение --state %q: допустимы failed, queued, pending, done", stateArg)
 		}
+
 		states = []journal.State{s}
 	}
+
 	recs, err := st.ByStates(nil, states)
 	if err != nil {
 		return &ExitError{Code: ExitSomeFailed, Err: err}
 	}
+
 	sort.Slice(recs, func(i, j int) bool {
 		if recs[i].Kind != recs[j].Kind {
 			return recs[i].Kind < recs[j].Kind
 		}
+
 		return recs[i].UpdatedAt.Before(recs[j].UpdatedAt)
 	})
 
-	if clear {
+	if doClear {
 		removed := 0
+
 		for _, rec := range recs {
 			ok, err := st.Delete(rec.Kind, rec.Target)
 			if err != nil {
 				return &ExitError{Code: ExitSomeFailed, Err: err}
 			}
+
 			if ok {
 				removed++
 			}
 		}
+
 		con.Successf("Удалено записей: %d", removed)
+
 		return nil
 	}
 
@@ -101,10 +115,13 @@ func runJobs(cmd *cobra.Command, journalFlag, stateArg string, clear, noColor bo
 		con.Infof("Журнал пуст")
 		return nil
 	}
+
 	for _, rec := range recs {
 		renderJobRecord(con, rec)
 	}
+
 	con.Dimf("Всего записей: %d", len(recs))
+
 	return nil
 }
 
@@ -114,10 +131,12 @@ func renderJobRecord(con *console.Console, rec journal.Record) {
 	if rec.Kind == journal.KindUpload {
 		label = "загрузка"
 	}
+
 	line := label + " " + displayTarget(rec.Target) + " — " + string(rec.State)
 	if !rec.UpdatedAt.IsZero() {
 		line += " (обновлено " + rec.UpdatedAt.Format("2006-01-02 15:04") + ")"
 	}
+
 	switch rec.State {
 	case journal.StateDone:
 		con.Successf("%s", line)
@@ -128,6 +147,7 @@ func renderJobRecord(con *console.Console, rec journal.Record) {
 	default:
 		con.Infof("%s", line)
 	}
+
 	if rec.ErrMsg != "" {
 		con.Dimf("%s", rec.ErrMsg)
 	}

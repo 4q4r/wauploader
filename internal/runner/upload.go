@@ -74,6 +74,7 @@
 //     save runner, which leaves its record queued — the brief pins the
 //     upload behavior), fires one Russian auth event, stops admitting
 //     new uploads and surfaces as the completion error.
+
 package runner
 
 import (
@@ -136,6 +137,7 @@ func (p *progressThrottle) step() int64 {
 	if s < progressMinStep {
 		s = progressMinStep
 	}
+
 	return s
 }
 
@@ -144,10 +146,12 @@ func (p *progressThrottle) emit(sent int64) bool {
 		p.last = 0
 		return false
 	}
+
 	if sent-p.last >= p.step() {
 		p.last = sent
 		return true
 	}
+
 	return false
 }
 
@@ -176,9 +180,11 @@ type UploadRunner struct {
 // upload host is constant — see the package doc above).
 func NewUploadRunner(cl *ias3.Client, st *journal.Store, lim Limits, con *console.Console) *UploadRunner {
 	lim = lim.withDefaults()
+
 	if con == nil {
 		con = console.New(io.Discard, io.Discard, false, true)
 	}
+
 	return &UploadRunner{
 		cl:   cl,
 		st:   st,
@@ -194,11 +200,14 @@ func NewUploadRunner(cl *ias3.Client, st *journal.Store, lim Limits, con *consol
 func (r *UploadRunner) Run(ctx context.Context, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting bool) (<-chan Event, func() (Summary, error)) {
 	events := make(chan Event)
 	res := &runResult{done: make(chan struct{})}
+
 	go func() {
 		defer close(events)
+
 		res.summary, res.err = r.execute(ctx, targets, o, verify, skipExisting, events)
 		close(res.done)
 	}()
+
 	return events, func() (Summary, error) {
 		<-res.done
 		return res.summary, res.err
@@ -211,14 +220,18 @@ func (r *UploadRunner) execute(ctx context.Context, targets []UploadTarget, o ia
 	if err := r.lim.Validate(); err != nil {
 		return Summary{}, err
 	}
+
 	c := &counters{}
+
 	items, err := r.planRun(targets, events, c)
 	if err != nil {
 		return c.summary(), err
 	}
 
 	var paused atomic.Bool
+
 	var authOnce sync.Once
+
 	var authErr error
 
 	// One goroutine per ITEM: the files of an item run strictly
@@ -227,20 +240,24 @@ func (r *UploadRunner) execute(ctx context.Context, targets []UploadTarget, o ia
 	// are journaled — so cancellation travels through gctx.
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.lim.Concurrency)
+
 	for _, it := range items {
 		if paused.Load() || gctx.Err() != nil {
 			break // stop admitting; in-flight items finish
 		}
+
 		g.Go(func() error {
 			r.processItem(gctx, it, o, verify, skipExisting, events, c, &paused, &authOnce, &authErr)
 			return nil
 		})
 	}
+
 	_ = g.Wait()
 
 	if authErr != nil {
 		return c.summary(), authErr
 	}
+
 	return c.summary(), ctx.Err()
 }
 
@@ -265,9 +282,11 @@ type uploadItem struct {
 // reported skipped (this contract has no force flag). Files are grouped
 // by identifier preserving first-appearance order; within an item the
 // first file bootstraps the item and the last one queues derive.
-func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *counters) ([]uploadItem, error) {
+func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *counters) ([]uploadItem, error) { //nolint:gocognit // journal-state → queue-decision matrix; each branch is one documented resume rule
 	seen := map[string]bool{}
+
 	var order []string
+
 	byItem := map[string][]uploadFile{}
 
 	add := func(t UploadTarget, rec *journal.Record) {
@@ -275,10 +294,13 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 		if seen[tgt] {
 			return
 		}
+
 		seen[tgt] = true
+
 		if _, ok := byItem[t.Identifier]; !ok {
 			order = append(order, t.Identifier)
 		}
+
 		byItem[t.Identifier] = append(byItem[t.Identifier], uploadFile{target: tgt, t: t, rec: rec})
 	}
 
@@ -287,12 +309,15 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 		r.con.Errorf("Не удалось прочитать журнал для возобновления: %v", err)
 		return nil, fmt.Errorf("чтение журнала не выполнено: %w", err)
 	}
+
 	for i := range resume {
 		rec := resume[i] // ByStates returns copies
+
 		t, ok := parseUploadRecordTarget(rec.Target)
 		if !ok {
 			return nil, fmt.Errorf("запись журнала повреждена — не разбирается как цель загрузки: %q", rec.Target)
 		}
+
 		add(t, &rec)
 	}
 
@@ -301,21 +326,26 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 		if err != nil {
 			return nil, err
 		}
+
 		tgt := uploadRecordTarget(t)
 		if seen[tgt] {
 			continue
 		}
+
 		rec, ok, err := r.st.Get(journal.KindUpload, tgt)
 		if err != nil {
 			r.con.Errorf("Не удалось прочитать запись журнала для %s: %v", t.Path, err)
 			return nil, fmt.Errorf("чтение журнала не выполнено: %w", err)
 		}
+
 		if ok && rec.State == journal.StateDone {
 			r.emit(events, Event{Kind: EventState, Target: tgt, State: journal.StateSkipped})
 			r.con.Dimf("Пропущено (уже загружено ранее): %s → %s/%s", t.Path, t.Identifier, t.Key)
 			c.incSkipped()
+
 			continue
 		}
+
 		if ok {
 			// failed or skipped in a previous run: an explicit re-list
 			// resets the work fields but keeps the record — and the
@@ -324,6 +354,7 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 				r.con.Errorf("Не удалось сбросить запись журнала для %s: %v", t.Path, err)
 				return nil, fmt.Errorf("сброс записи журнала не выполнен: %w", err)
 			}
+
 			rec.State = journal.StateQueued
 			rec.ErrKind, rec.ErrMsg = "", ""
 		} else {
@@ -332,45 +363,56 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 				r.con.Errorf("Не удалось создать запись журнала для %s: %v", t.Path, err)
 				return nil, fmt.Errorf("создание записи журнала не выполнено: %w", err)
 			}
+
 			rec = fresh
 		}
+
 		add(t, rec)
 	}
 
 	items := make([]uploadItem, 0, len(order))
 	for _, id := range order {
 		files := byItem[id]
+
 		var total int64
+
 		for i := range files {
 			st, err := os.Stat(files[i].t.Path)
 			if err != nil {
 				continue // the hash stage reports this failure properly
 			}
+
 			total += st.Size()
 		}
+
 		files[0].bootstrap = true
 		files[len(files)-1].lastInPlan = true
 		items = append(items, uploadItem{identifier: id, files: files, totalBytes: total})
 	}
+
 	return items, nil
 }
 
 // processItem runs one item's sequential chain: hash → skip-if-exists →
 // preflight → PUT → verify per file, then the per-item derive watch.
-func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.HeaderOpts, verify, skipExisting bool, events chan<- Event, c *counters, paused *atomic.Bool, authOnce *sync.Once, authErr *error) {
+func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.HeaderOpts, verify, skipExisting bool, events chan<- Event, c *counters, paused *atomic.Bool, authOnce *sync.Once, authErr *error) { //nolint:gocognit,gocyclo // per-file state machine: preflight/skip/PUT/verify branches mirror the wire; 72 gocognit / 34 gocyclo vs caps 30/20
 	if paused.Load() {
 		return
 	}
+
 	var (
 		baseline     int64
 		haveBaseline bool
 		deriveArmed  bool // a PUT carrying QueueDerive=true succeeded
 	)
+
 	for i := range it.files {
 		f := &it.files[i]
+
 		if paused.Load() || ctx.Err() != nil {
 			return
 		}
+
 		r.emit(events, Event{Kind: EventState, Target: f.target, State: f.rec.State})
 
 		// Stage 1: hash once. The digests persist, so resumed runs
@@ -381,6 +423,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				r.failFile(events, c, f, "hash", err.Error())
 				continue
 			}
+
 			f.rec.MD5, f.rec.SHA256, f.rec.Size = md5hex, shaHex, size
 			if err := r.persist(f, journal.StateQueued); err != nil {
 				r.journalError(events, c, f, err)
@@ -394,32 +437,37 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		// md5 alone does not prove the skip. An erroring Tasks API
 		// makes the skip undecidable — the file fails retryable (the
 		// next run retries it) instead of skipping on doubt.
-		if skipExisting {
+		if skipExisting { //nolint:nestif // skip-guard: md5 proof and tasks-busy checks nest by design
 			exists, err := r.cl.FileExistsMatchingMD5(ctx, f.t.Identifier, f.t.Key, f.rec.MD5)
 			if err != nil {
 				r.failFile(events, c, f, "skip-check", err.Error())
 				continue
 			}
+
 			if exists {
 				active, err := r.cl.HasActiveTasks(ctx, f.t.Identifier)
 				if err != nil {
 					r.failFile(events, c, f, "skip-guard", fmt.Sprintf("не удалось проверить активные задачи item — пропуск недостоверен: %v", err))
 					continue
 				}
+
 				if active {
 					note := "в item активны задачи — пропуск отменён, файл будет загружен"
 					r.emit(events, Event{Kind: EventWait, Target: f.target, State: f.rec.State, ErrMsg: note})
 					r.con.Dimf("%s → %s/%s: %s", f.t.Path, f.t.Identifier, f.t.Key, note)
 				} else {
 					note := "уже в элементе, пропущен (md5 совпал)"
+
 					f.rec.ErrKind, f.rec.ErrMsg = "", ""
 					if err := r.persist(f, journal.StateSkipped); err != nil {
 						r.journalError(events, c, f, err)
 						continue
 					}
+
 					c.incSkipped()
 					r.emit(events, Event{Kind: EventState, Target: f.target, State: journal.StateSkipped, ErrMsg: note})
 					r.con.Dimf("Пропущено (уже в элементе, md5 совпал): %s → %s/%s", f.t.Path, f.t.Identifier, f.t.Key)
+
 					continue
 				}
 			}
@@ -433,7 +481,9 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			if ctx.Err() != nil {
 				return // cancelled while waiting; the record stays queued
 			}
+
 			r.failFile(events, c, f, "check-limit", fmt.Sprintf("лимит очереди IA-S3 стабильно занят: %v", err))
+
 			continue
 		}
 
@@ -443,12 +493,13 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		// files stay queued and resumable, because every later PUT
 		// would leave the derive watch without a baseline.
 		if o.QueueDerive && !haveBaseline {
-			b, err := r.cl.NewestDeriveTaskID(ctx, it.identifier)
+			base, err := r.cl.NewestDeriveTaskID(ctx, it.identifier)
 			if err != nil {
 				r.failFile(events, c, f, "derive-baseline", err.Error())
 				return
 			}
-			baseline, haveBaseline = b, true
+
+			baseline, haveBaseline = base, true
 		}
 
 		// Pacing gate for PUT admissions (no-op at rate.Inf).
@@ -460,12 +511,14 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		// a returned error is terminal here and the next run restarts
 		// the file from byte 0 (no resume exists server-side).
 		opt := o
+
 		opt.AutoMakeBucket = f.bootstrap
 		if f.bootstrap {
 			opt.SizeHint = it.totalBytes
 		} else {
 			opt.SizeHint = 0
 		}
+
 		opt.QueueDerive = o.QueueDerive && f.lastInPlan
 
 		size := f.rec.Size
@@ -475,6 +528,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				r.emit(events, Event{Kind: EventProgress, Target: f.target, Sent: sent, Total: size})
 			}
 		}
+
 		req := ias3.UploadRequest{
 			Identifier: f.t.Identifier,
 			Key:        f.t.Key,
@@ -486,9 +540,12 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			if errors.Is(err, ias3.ErrBadCredentials) {
 				r.failFile(events, c, f, "auth", err.Error())
 				r.authPause(events, paused, authOnce, authErr, err)
+
 				return
 			}
+
 			r.failFile(events, c, f, "upload", err.Error())
+
 			continue
 		}
 		// The derive-queueing PUT went out successfully: arm the watch
@@ -497,6 +554,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		if o.QueueDerive && f.lastInPlan {
 			deriveArmed = true
 		}
+
 		r.emit(events, Event{Kind: EventProgress, Target: f.target, Sent: size, Total: size})
 
 		// Stage 5: verify the remote copy by MD5.
@@ -513,6 +571,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			r.journalError(events, c, f, err)
 			continue
 		}
+
 		c.incDone()
 		r.emit(events, Event{Kind: EventState, Target: f.target, State: journal.StateDone})
 		r.con.Successf("Загружено: %s → %s/%s", f.t.Path, f.t.Identifier, f.t.Key)
@@ -525,8 +584,10 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 	if !deriveArmed || !haveBaseline {
 		return
 	}
+
 	r.emit(events, Event{Kind: EventWait, Target: it.identifier, ErrMsg: "ожидание деривации элемента"})
 	r.con.Infof("Ожидание деривации элемента «%s»...", it.identifier)
+
 	err := ias3.WaitDerive(ctx, r.cl, it.identifier, baseline, r.lim.PollStart, r.lim.JobWait)
 	switch {
 	case err == nil:
@@ -549,23 +610,27 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 // retried; a definite mismatch fails immediately.
 func (r *UploadRunner) verifyUpload(ctx context.Context, t UploadTarget, md5hex string) error {
 	var lastErr error
+
 	for attempt := 1; attempt <= verifyAttempts; attempt++ {
 		files, err := r.cl.ItemFiles(ctx, t.Identifier)
 		if err != nil {
 			if ctx.Err() != nil {
 				return fmt.Errorf("проверка загрузки прервана: %w", ctx.Err())
 			}
+
 			lastErr = err
 		} else {
 			lastErr = nil
+
 			for _, f := range files {
 				if f.Name != t.Key {
 					continue
 				}
-				switch {
-				case f.MD5 == md5hex:
+
+				switch f.MD5 {
+				case md5hex:
 					return nil
-				case f.MD5 == "":
+				case "":
 					// No digest to prove identity with — treat as lag.
 					lastErr = fmt.Errorf("файл %s пока числится в элементе без md5", t.Key)
 				default:
@@ -573,13 +638,16 @@ func (r *UploadRunner) verifyUpload(ctx context.Context, t UploadTarget, md5hex 
 						t.Key, f.MD5, md5hex)
 				}
 			}
+
 			if lastErr == nil {
 				lastErr = fmt.Errorf("файл %s пока не появился в метаданных элемента (задержка обработки archive.org)", t.Key)
 			}
 		}
+
 		if attempt == verifyAttempts {
 			return fmt.Errorf("проверка загрузки не удалась после %d попыток: %w", verifyAttempts, lastErr)
 		}
+
 		if !sleepCtx(ctx, r.lim.PollStart) {
 			return fmt.Errorf("проверка загрузки прервана: %w", ctx.Err())
 		}
@@ -602,6 +670,7 @@ func (r *UploadRunner) persist(f *uploadFile, st journal.State) error {
 	if err == nil {
 		f.rec.State = st
 	}
+
 	return err
 }
 
@@ -612,6 +681,7 @@ func (r *UploadRunner) failFile(events chan<- Event, c *counters, f *uploadFile,
 		r.journalError(events, c, f, err)
 		return
 	}
+
 	c.incFailed()
 	r.emit(events, Event{Kind: EventState, Target: f.target, State: journal.StateFailed, ErrMsg: msg})
 	r.con.Errorf("Не загружено: %s → %s/%s: %s", f.t.Path, f.t.Identifier, f.t.Key, msg)
@@ -621,6 +691,7 @@ func (r *UploadRunner) failFile(events chan<- Event, c *counters, f *uploadFile,
 // be guaranteed, so the file counts as failed and the error is loud.
 func (r *UploadRunner) journalError(events chan<- Event, c *counters, f *uploadFile, err error) {
 	c.incFailed()
+
 	msg := fmt.Sprintf("ошибка записи журнала: %v", err)
 	r.emit(events, Event{Kind: EventState, Target: f.target, State: f.rec.State, ErrMsg: msg})
 	r.con.Errorf("%s: %v", f.t.Path, err)
@@ -632,6 +703,7 @@ func (r *UploadRunner) journalError(events chan<- Event, c *counters, f *uploadF
 func (r *UploadRunner) authPause(events chan<- Event, paused *atomic.Bool, authOnce *sync.Once, authErr *error, cause error) {
 	authOnce.Do(func() {
 		paused.Store(true)
+
 		*authErr = fmt.Errorf("ошибка авторизации archive.org (%v): выполнение очереди приостановлено — проверьте ключи s3_access/s3_secret в конфигурации и запустите снова", cause)
 		r.emit(events, Event{Kind: EventAuth, ErrMsg: (*authErr).Error()})
 		r.con.Errorf("%v", *authErr)
@@ -658,10 +730,12 @@ func parseUploadRecordTarget(s string) (UploadTarget, bool) {
 	if !ok || path == "" {
 		return UploadTarget{}, false
 	}
+
 	id, key, ok := strings.Cut(rest, "/")
 	if !ok || id == "" || key == "" {
 		return UploadTarget{}, false
 	}
+
 	return UploadTarget{Path: path, Identifier: id, Key: key}, true
 }
 
@@ -672,17 +746,21 @@ func normalizeUploadTarget(t UploadTarget) (UploadTarget, error) {
 	if t.Path == "" {
 		return t, errors.New("цель загрузки без пути к файлу")
 	}
+
 	if t.Identifier == "" {
 		return t, fmt.Errorf("для файла %s не указан идентификатор элемента", t.Path)
 	}
+
 	abs, err := filepath.Abs(t.Path)
 	if err != nil {
 		return t, fmt.Errorf("не удалось определить полный путь для %s: %w", t.Path, err)
 	}
+
 	t.Path = abs
 	if t.Key == "" {
 		t.Key = filepath.Base(abs)
 	}
+
 	return t, nil
 }
 
@@ -695,10 +773,12 @@ func hashUploadFilePath(path string) (md5hex, shaHex string, size int64, err err
 		return "", "", 0, fmt.Errorf("не удалось открыть файл %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
+
 	md5hex, shaHex, size, err = hashUploadFile(f)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("файл %s: %w", path, err)
 	}
+
 	return md5hex, shaHex, size, nil
 }
 
@@ -710,9 +790,11 @@ func hashUploadFile(src io.Reader) (md5hex, shaHex string, size int64, err error
 	md5h := md5.New()
 	shaH := sha256.New()
 	buf := make([]byte, 1<<20)
+
 	n, err := io.CopyBuffer(io.MultiWriter(md5h, shaH), src, buf)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("подсчёт контрольных сумм: %w", err)
 	}
+
 	return hex.EncodeToString(md5h.Sum(nil)), hex.EncodeToString(shaH.Sum(nil)), n, nil
 }

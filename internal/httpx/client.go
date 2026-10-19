@@ -51,6 +51,7 @@ func NewClient(jar http.CookieJar, userAgent string) *Client {
 	if userAgent == "" {
 		userAgent = version.UserAgent()
 	}
+
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -68,6 +69,7 @@ func NewClient(jar http.CookieJar, userAgent string) *Client {
 	if tr.Protocols == nil {
 		tr.Protocols = &http.Protocols{}
 	}
+
 	tr.Protocols.SetHTTP1(true)
 	tr.Protocols.SetHTTP2(false)
 
@@ -93,6 +95,7 @@ func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", t.userAgent)
 	}
+
 	return t.base.RoundTrip(req)
 }
 
@@ -106,17 +109,22 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
 		return fmt.Errorf("%w: stopped after %d redirects", ErrTooManyRedirects, maxRedirects)
 	}
+
 	if len(via) == 0 {
 		return nil
 	}
+
 	origAuth := via[0].Header.Get("Authorization")
 	if redirectAuthAllowed(req.URL.Hostname()) {
 		if origAuth != "" {
 			req.Header.Set("Authorization", origAuth)
 		}
+
 		return nil
 	}
+
 	req.Header.Del("Authorization")
+
 	return nil
 }
 

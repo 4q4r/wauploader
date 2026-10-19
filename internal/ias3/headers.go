@@ -75,30 +75,39 @@ func (h HeaderOpts) headers() http.Header {
 	}
 	// 0 must be expressible (skip derive), so emit unconditionally.
 	hdr.Set("x-archive-queue-derive", boolToHeader(h.QueueDerive))
+
 	if h.SizeHint > 0 {
 		hdr.Set("x-archive-size-hint", strconv.FormatInt(h.SizeHint, 10))
 	}
+
 	if h.Mediatype != "" {
 		hdr.Set("x-archive-meta-mediatype", encodeMetaValue(h.Mediatype))
 	}
+
 	if h.Collection != "" {
 		hdr.Set("x-archive-meta01-collection", encodeMetaValue(h.Collection))
 	}
+
 	if h.Title != "" {
 		hdr.Set("x-archive-meta-title", encodeMetaValue(h.Title))
 	}
+
 	if h.Description != "" {
 		hdr.Set("x-archive-meta-description", encodeMetaValue(h.Description))
 	}
+
 	if h.KeepOldVersion {
 		hdr.Set("x-archive-keep-old-version", "1")
 	}
+
 	if h.InteractivePriority {
 		hdr.Set("x-archive-interactive-priority", "1")
 	}
+
 	if h.IgnorePreexistingBucket {
 		hdr.Set("x-archive-ignore-preexisting-bucket", "1")
 	}
+
 	for name, values := range h.Extra {
 		if len(values) == 0 {
 			continue
@@ -113,10 +122,12 @@ func (h HeaderOpts) headers() http.Header {
 			hdr.Set("x-archive-meta-"+wire, encodeMetaValue(values[0]))
 			continue
 		}
+
 		for i, v := range values {
 			hdr.Set(fmt.Sprintf("x-archive-meta%02d-%s", i, wire), encodeMetaValue(v))
 		}
 	}
+
 	return hdr
 }
 
@@ -124,6 +135,7 @@ func boolToHeader(b bool) string {
 	if b {
 		return "1"
 	}
+
 	return "0"
 }
 
@@ -145,7 +157,9 @@ func validateExtraMeta(m Meta) error {
 	if len(m) == 0 {
 		return nil
 	}
+
 	var bad, bracketed []string
+
 	for name := range m {
 		switch {
 		case strings.ContainsAny(name, "[]"):
@@ -154,13 +168,16 @@ func validateExtraMeta(m Meta) error {
 			bad = append(bad, "«"+name+"»")
 		}
 	}
+
 	if len(bracketed) > 0 {
 		return fmt.Errorf("недопустимые имена метаданных: %s — имена метаданных со скобками не поддерживаются S3-заголовками (передавайте такие поля через Item Metadata API)",
 			strings.Join(bracketed, ", "))
 	}
+
 	if len(bad) == 0 {
 		return nil
 	}
+
 	return fmt.Errorf("недопустимые имена метаданных: %s — имя должно начинаться с буквы и содержать только буквы, цифры, точку, дефис или подчёркивание (пара дефисов «--» допустима и означает подчёркивание)",
 		strings.Join(bad, ", "))
 }
@@ -176,6 +193,7 @@ func encodeMetaValue(v string) string {
 	if !isASCII(v) || needsQuote(v) {
 		return "uri(" + percentEncodeUTF8(v) + ")"
 	}
+
 	return v
 }
 
@@ -185,6 +203,7 @@ func isASCII(s string) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -198,6 +217,7 @@ func needsQuote(v string) bool {
 			return true
 		}
 	}
+
 	return len(v) > 0 && (v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t')
 }
 
@@ -206,8 +226,10 @@ func needsQuote(v string) bool {
 // urllib.parse.quote(value.encode("utf-8")) semantics.
 func percentEncodeUTF8(s string) string {
 	const hexDigits = "0123456789ABCDEF"
+
 	var b strings.Builder
 	b.Grow(len(s) * 3)
+
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
@@ -220,6 +242,7 @@ func percentEncodeUTF8(s string) string {
 			b.WriteByte(hexDigits[c&0x0f])
 		}
 	}
+
 	return b.String()
 }
 
@@ -232,6 +255,7 @@ func ValidateIdentifier(id string) error {
 	if n := len(id); n < 5 || n > 80 {
 		rules = append(rules, fmt.Sprintf("длина %d, а требуется от 5 до 80 символов", n))
 	}
+
 	if id != "" {
 		first, _ := utf8.DecodeRuneInString(id)
 		if !isAlnumASCII(first) {
@@ -245,18 +269,24 @@ func ValidateIdentifier(id string) error {
 			c == '.' || c == '_' || c == '-' {
 			continue
 		}
+
 		rules = append(rules, "недопустимые символы: разрешены только латинские буквы, цифры, точка, подчёркивание и дефис (A-Z, a-z, 0-9, ., _, -)")
+
 		break
 	}
+
 	if strings.HasSuffix(id, "_meta.xml") {
 		rules = append(rules, "идентификатор не может оканчиваться на «_meta.xml»: это служебное имя файла метаданных внутри элемента")
 	}
+
 	if strings.HasSuffix(id, "_files.xml") {
 		rules = append(rules, "идентификатор не может оканчиваться на «_files.xml»: это служебное имя файла описания файлов внутри элемента")
 	}
+
 	if len(rules) == 0 {
 		return nil
 	}
+
 	return fmt.Errorf("идентификатор «%s» не соответствует правилам archive.org: %s",
 		id, strings.Join(rules, "; "))
 }
