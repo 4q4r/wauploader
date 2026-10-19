@@ -46,7 +46,9 @@ type HeaderOpts struct {
 	// bracket suffix: bracketed names are legal metadata keys in the JSON
 	// Item Metadata API but cannot ride S3 header names, so Upload rejects
 	// them (and any other invalid name) fail-fast in Russian — see
-	// validateExtraMeta.
+	// validateExtraMeta. Underscores are encoded as "--" on the wire
+	// (proxies drop "_" from header names; IA translates "--" back to "_"
+	// in the stored key, matching the reference client).
 	Extra Meta
 
 	AutoMakeBucket          bool // x-archive-auto-make-bucket: 1 — create the item on this PUT
@@ -101,7 +103,12 @@ func (h HeaderOpts) headers() http.Header {
 		if len(values) == 0 {
 			continue
 		}
-		wire := strings.ReplaceAll(name, "--", "_")
+		// Wire encoding (reference client iarequest.py
+		// _add_metadata_headers): underscores become "--" because some
+		// proxies drop "_" from header names; a literal "--" passes
+		// through unchanged. IA translates "--" back to "_" in the stored
+		// metadata key, so both spellings converge on the same key.
+		wire := strings.ReplaceAll(name, "_", "--")
 		if len(values) == 1 {
 			hdr.Set("x-archive-meta-"+wire, encodeMetaValue(values[0]))
 			continue
@@ -130,9 +137,10 @@ var metaNameRe = regexp.MustCompile(`^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$`)
 // naming every invalid key. Two rejection classes: bracketed names —
 // legal metadata keys in the JSON Item Metadata API, but S3 header names
 // cannot contain "[" or "]" — and names failing the reference validator
-// ^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$. Names spelled with "--" are
-// accepted: they are translated to "_" for the wire because RFC 822
-// header names cannot carry underscores (IA translates them back).
+// ^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$. Underscores are fine: they
+// are encoded as "--" on the wire (proxies drop "_" from header names)
+// and IA translates "--" back to "_" in the stored key; a literal "--"
+// passes through and lands on the same stored key.
 func validateExtraMeta(m Meta) error {
 	if len(m) == 0 {
 		return nil
@@ -157,15 +165,18 @@ func validateExtraMeta(m Meta) error {
 		strings.Join(bad, ", "))
 }
 
-// encodeMetaValue passes ASCII values through verbatim and wraps values
-// with non-ASCII bytes as uri(<percent-encoded-utf8>), the IA-S3
-// workaround for non-ASCII metadata (r2 §2.2; example:
-// uri(This%20is%20a%20snowman%20%E2%98%83)).
+// encodeMetaValue passes plain ASCII through verbatim and wraps values
+// needing protection as uri(<percent-encoded-utf8>), the IA-S3 workaround
+// for non-ASCII metadata (r2 §2.2; example:
+// uri(This%20is%20a%20snowman%20%E2%98%83)). Non-ASCII always needs the
+// wrap; ASCII needs it when it carries control bytes or
+// leading/trailing whitespace, which would corrupt or be rejected as an
+// HTTP header value.
 func encodeMetaValue(v string) string {
-	if isASCII(v) {
-		return v
+	if !isASCII(v) || needsQuote(v) {
+		return "uri(" + percentEncodeUTF8(v) + ")"
 	}
-	return "uri(" + percentEncodeUTF8(v) + ")"
+	return v
 }
 
 func isASCII(s string) bool {
@@ -175,6 +186,19 @@ func isASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// needsQuote reports whether an ASCII value is unsafe as a raw header
+// value: any control byte (C0, DEL) anywhere, or a leading/trailing
+// space or tab that header trimming would silently destroy.
+func needsQuote(v string) bool {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return len(v) > 0 && (v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t')
 }
 
 // percentEncodeUTF8 escapes every byte outside the RFC 3986 unreserved set

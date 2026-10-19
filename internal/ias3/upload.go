@@ -174,15 +174,33 @@ func parseOverLimit(raw json.RawMessage) (bool, error) {
 	return false, fmt.Errorf("ожидается bool или число, получено: %s", truncateFragment(string(raw)))
 }
 
+// maxCheckLimitErrors caps CONSECUTIVE errored CheckLimit calls inside
+// awaitNotOverLimit. A legit over_limit=1 answer is valid server state
+// and keeps polling unbounded; a stably failing endpoint is an outage,
+// and polling it forever would hang the upload loop.
+const maxCheckLimitErrors = 8
+
 // awaitNotOverLimit polls CheckLimit until the overload flag clears or
 // ctx ends. The loop is the fail-safe consumer of CheckLimit: an errored
 // check counts as "still overloaded" and keeps polling at checkLimitPoll
 // cadence, so a flapping endpoint never produces a false green light.
+// maxCheckLimitErrors consecutive errored checks (without a single
+// success in between) end the loop with the last error: the endpoint is
+// broken, not busy. A successful check resets the counter.
 func awaitNotOverLimit(ctx context.Context, c *Client, identifier string) error {
+	consecutiveErrs := 0
 	for {
 		over, err := c.CheckLimit(ctx, identifier)
-		if err == nil && !over {
-			return nil
+		if err == nil {
+			consecutiveErrs = 0
+			if !over {
+				return nil
+			}
+		} else {
+			consecutiveErrs++
+			if consecutiveErrs >= maxCheckLimitErrors {
+				return fmt.Errorf("проверка лимита очереди стабильно падает (%d попыток подряд), загрузка отменена: %w", maxCheckLimitErrors, err)
+			}
 		}
 		if cerr := ctx.Err(); cerr != nil {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", cerr)

@@ -102,7 +102,8 @@ func TestHeadersExactNames(t *testing.T) {
 		SizeHint: 12345,
 		Extra: Meta{
 			"language":            {"rus", "eng"}, // multi-value → meta00/meta01 numbering
-			"publisher--year":     {"2026"},       // "--" translated to "_"
+			"publisher_year":      {"2026"},       // "_" encoded as "--" on the wire
+			"some--name":          {"v"},          // literal "--" passes through unchanged
 			"external-identifier": {"urn:x:1"},
 		},
 	}
@@ -119,13 +120,76 @@ func TestHeadersExactNames(t *testing.T) {
 		"X-Archive-Meta-Description":          {"plain desc"},
 		"X-Archive-Meta00-Language":           {"rus"},
 		"X-Archive-Meta01-Language":           {"eng"},
-		"X-Archive-Meta-Publisher_year":       {"2026"},
+		"X-Archive-Meta-Publisher--Year":      {"2026"},
+		"X-Archive-Meta-Some--Name":           {"v"},
 		"X-Archive-Meta-External-Identifier":  {"urn:x:1"},
 		"X-Archive-Ignore-Preexisting-Bucket": {"1"},
 	}
 	assert.Equal(t, want, got)
 	assert.Empty(t, got.Values("X-Archive-Interactive-Priority"),
 		"InteractivePriority=false must not emit a header")
+
+	// The other spelling converges on the same wire shape: both "_" and a
+	// literal "--" produce "--" on the wire, and the server translates
+	// "--" back to "_" in the stored metadata key (reference client
+	// iarequest.py _add_metadata_headers).
+	converged := (HeaderOpts{Extra: Meta{"publisher--year": {"2026"}}}).headers()
+	assert.Equal(t, http.Header{
+		"X-Archive-Queue-Derive":         {"0"}, // always emitted; zero opts → derive off
+		"X-Archive-Meta-Publisher--Year": {"2026"},
+	}, converged)
+}
+
+// --- metadata value quoting -------------------------------------------------
+
+func TestMetaValueQuoting(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"hello", "hello"},                                      // plain ASCII passes through
+		{"  padded  ", "uri(%20%20padded%20%20)"},               // leading/trailing spaces
+		{"line\nbreak", "uri(line%0Abreak)"},                    // control byte
+		{"tab\there", "uri(tab%09here)"},                        // control byte
+		{"Тест ☃", "uri(%D0%A2%D0%B5%D1%81%D1%82%20%E2%98%83)"}, // non-ASCII
+	}
+	for _, tc := range cases {
+		assert.Equalf(t, tc.want, encodeMetaValue(tc.in), "encodeMetaValue(%q)", tc.in)
+	}
+}
+
+// --- check_limit broken-endpoint cap -----------------------------------------
+
+func TestAwaitNotOverLimitErrorCap(t *testing.T) {
+	shrinkPacing(t)
+	puts, checks := 0, 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts++
+			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>busy</Message></Error>`))
+			return
+		}
+		if r.URL.Query().Get("check_limit") == "1" {
+			checks++
+			// Hard non-200: CheckLimit fails safe to overloaded with an
+			// error, and the httpx ladder passes 403 through instantly
+			// (a 500 would burn seconds of retry-ladder backoff per check).
+			w.WriteHeader(http.StatusForbidden)
+		}
+	})
+	cl, _ := newTestClient(t, h)
+	path := writeTempFile(t, "data")
+
+	err := cl.Upload(context.Background(), UploadRequest{
+		Identifier: "testid1", Key: "file.bin", Path: path, Size: 4,
+	}, HeaderOpts{Mediatype: "data"}, nil)
+
+	require.Error(t, err, "a stably failing check_limit must end the wait, not hang")
+	assert.Contains(t, err.Error(), "проверка лимита очереди стабильно падает")
+	assert.Equal(t, 1, puts, "the upload loop must stop at the broken preflight")
+	assert.Equal(t, maxCheckLimitErrors, checks, "consecutive errored checks must be capped")
 }
 
 // --- Upload ---------------------------------------------------------------
