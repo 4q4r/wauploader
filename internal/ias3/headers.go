@@ -145,7 +145,7 @@ func boolToHeader(b bool) string {
 // optional numeric bracket suffix.
 var metaNameRe = regexp.MustCompile(`^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$`)
 
-// validateExtraMeta checks every Extra key and returns one Russian error
+// ValidateExtraMeta checks every Extra key and returns one Russian error
 // naming every invalid key. Two rejection classes: bracketed names —
 // legal metadata keys in the JSON Item Metadata API, but S3 header names
 // cannot contain "[" or "]" — and names failing the reference validator
@@ -153,7 +153,13 @@ var metaNameRe = regexp.MustCompile(`^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$`)
 // are encoded as "--" on the wire (proxies drop "_" from header names)
 // and IA translates "--" back to "_" in the stored key; a literal "--"
 // passes through and lands on the same stored key.
-func validateExtraMeta(m Meta) error {
+//
+// Exported as the early-validation seam (T11 sanctioned-seams precedent):
+// the upload command validates --meta names at flag-parsing time so a
+// malformed name is a usage error before any per-file work, not a
+// per-file failure after hashing. Upload still validates the final
+// option set defensively.
+func ValidateExtraMeta(m Meta) error {
 	if len(m) == 0 {
 		return nil
 	}

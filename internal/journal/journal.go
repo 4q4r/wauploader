@@ -80,6 +80,15 @@ type Record struct {
 	ErrKind string
 	ErrMsg  string
 
+	// Title/Description/Extra carry the per-target item metadata
+	// (--auto-meta, fix round 2) so a RESUMED upload rebuilds the same
+	// PUT headers. Add-fields-only gob evolution per the T9 policy:
+	// records written before these fields decode with zero values and
+	// SchemaVersion stays 1.
+	Title       string
+	Description string
+	Extra       map[string][]string
+
 	// UpdatedAt is maintained by Put/UpdateState when left zero.
 	UpdatedAt time.Time
 
@@ -171,7 +180,10 @@ func (s *Store) Close() error {
 // recordBody is the gob-encoded payload of a version-1 record. SchemaVersion
 // travels as the first byte of the stored value, outside the payload, so the
 // version can be checked before any decode attempt. A future schema bump adds
-// a new body type and a decode branch in this file only.
+// a new body type and a decode branch in this file only. Evolution is
+// add-fields-only: new fields (Title/Description/Extra — the --auto-meta
+// per-target metadata) decode as zero values from records written by older
+// binaries, so the version byte stays 1.
 type recordBody struct {
 	Kind              Kind
 	Target            string
@@ -186,6 +198,9 @@ type recordBody struct {
 	ErrKind           string
 	ErrMsg            string
 	UpdatedAt         time.Time
+	Title             string
+	Description       string
+	Extra             map[string][]string
 }
 
 // encodeRecord marshals r behind the single marshal pair: version byte + gob
@@ -205,6 +220,9 @@ func encodeRecord(r *Record) ([]byte, error) {
 		ErrKind:           r.ErrKind,
 		ErrMsg:            r.ErrMsg,
 		UpdatedAt:         r.UpdatedAt,
+		Title:             r.Title,
+		Description:       r.Description,
+		Extra:             r.Extra,
 	}
 
 	var buf bytes.Buffer
@@ -247,6 +265,9 @@ func decodeRecord(val []byte) (*Record, error) {
 		ErrKind:           body.ErrKind,
 		ErrMsg:            body.ErrMsg,
 		UpdatedAt:         body.UpdatedAt,
+		Title:             body.Title,
+		Description:       body.Description,
+		Extra:             body.Extra,
 		SchemaVersion:     version,
 	}, nil
 }

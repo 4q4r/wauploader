@@ -165,10 +165,18 @@ func (p *progressThrottle) emit(sent int64) bool {
 
 // UploadTarget is one file bound for one IA item. Key defaults to the
 // file's base name; Identifier is required.
+//
+// Per-target item metadata (--auto-meta, Task 14): a non-empty Title or
+// Description overrides the batch HeaderOpts value on THIS file's PUTs,
+// and Extra values append after the batch Extra values for the same
+// names (batch first, derived second). Zero-value fields change nothing.
 type UploadTarget struct {
-	Path       string
-	Identifier string
-	Key        string
+	Path        string
+	Identifier  string
+	Key         string
+	Title       string
+	Description string
+	Extra       ias3.Meta
 }
 
 // UploadRunner drives the upload pipeline over one ias3 client and one
@@ -326,6 +334,10 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 			return nil, fmt.Errorf("запись журнала повреждена — не разбирается как цель загрузки: %q", rec.Target)
 		}
 
+		// Restore the persisted per-target metadata (--auto-meta): a
+		// resumed upload must rebuild the same PUT headers.
+		t.Title, t.Description, t.Extra = rec.Title, rec.Description, rec.Extra
+
 		add(t, &rec)
 	}
 
@@ -337,6 +349,11 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 
 		tgt := uploadRecordTarget(t)
 		if seen[tgt] {
+			// Queued in a previous run AND re-listed now: merge the fresh
+			// derivation onto the resume entry (fresh wins, journal
+			// fills — mergeFreshMeta).
+			mergeFreshMeta(byItem[t.Identifier], tgt, t)
+
 			continue
 		}
 
@@ -357,16 +374,56 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 		if ok {
 			// failed or skipped in a previous run: an explicit re-list
 			// resets the work fields but keeps the record — and the
-			// persisted digests, so the file is not re-hashed.
-			if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, resetRecord); err != nil {
+			// persisted digests, so the file is not re-hashed. The
+			// per-target metadata is refreshed from the fresh derivation.
+			if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, func(m *journal.Record) {
+				resetRecord(m)
+				m.Title, m.Description, m.Extra = t.Title, t.Description, t.Extra
+			}); err != nil {
 				r.con.Errorf("Не удалось сбросить запись журнала для %s: %v", t.Path, err)
 				return nil, fmt.Errorf("сброс записи журнала не выполнен: %w", err)
 			}
 
 			rec.State = journal.StateQueued
 			rec.ErrKind, rec.ErrMsg = "", ""
+
+			// Refresh the persisted metadata with the same guard
+			// semantics as mergeFreshMeta: fresh non-empty values win,
+			// persisted values are never wiped by an empty re-listing.
+			if t.Title != "" {
+				rec.Title = t.Title
+			}
+
+			if t.Description != "" {
+				rec.Description = t.Description
+			}
+
+			if len(t.Extra) > 0 {
+				rec.Extra = mergeExtra(t.Extra, rec.Extra)
+			}
+
+			// The in-memory target rides the merged values too, so an
+			// empty-fresh re-list still PUTs the journal-held metadata.
+			if t.Title == "" {
+				t.Title = rec.Title
+			}
+
+			if t.Description == "" {
+				t.Description = rec.Description
+			}
+
+			if len(t.Extra) == 0 {
+				t.Extra = rec.Extra
+			}
 		} else {
-			fresh := &journal.Record{Kind: journal.KindUpload, Target: tgt, State: journal.StateQueued}
+			fresh := &journal.Record{
+				Kind:        journal.KindUpload,
+				Target:      tgt,
+				State:       journal.StateQueued,
+				Title:       t.Title,
+				Description: t.Description,
+				Extra:       t.Extra,
+			}
 			if err := r.st.Put(fresh); err != nil {
 				r.con.Errorf("Не удалось создать запись журнала для %s: %v", t.Path, err)
 				return nil, fmt.Errorf("создание записи журнала не выполнено: %w", err)
@@ -399,6 +456,105 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 	}
 
 	return items, nil
+}
+
+// mergeExtra unions two Extra maps per key, order-preserving: the fresh
+// values ride as-is first, held (journal) values append ONLY when not
+// already present for that key — an identical re-derivation on resume
+// must not duplicate subject values on the wire.
+func mergeExtra(fresh, held ias3.Meta) ias3.Meta {
+	if len(fresh) == 0 {
+		return held
+	}
+
+	merged := make(ias3.Meta, len(fresh)+len(held))
+	for name, values := range fresh {
+		merged[name] = append(merged[name], values...)
+	}
+
+	for name, values := range held {
+		for _, v := range values {
+			if !containsString(merged[name], v) {
+				merged[name] = append(merged[name], v)
+			}
+		}
+	}
+
+	return merged
+}
+
+func containsString(values []string, v string) bool {
+	for _, s := range values {
+		if s == v {
+			return true
+		}
+	}
+
+	return false
+}
+
+// mergeFreshMeta applies a re-listed target's fresh derivation onto the
+// already-added resume entry: fresh values win when present, the journal
+// fills the rest (per field; Extra via mergeExtra).
+func mergeFreshMeta(files []uploadFile, tgt string, fresh UploadTarget) {
+	for idx := range files {
+		if files[idx].target != tgt {
+			continue
+		}
+
+		if fresh.Title != "" {
+			files[idx].t.Title = fresh.Title
+		}
+
+		if fresh.Description != "" {
+			files[idx].t.Description = fresh.Description
+		}
+
+		if len(fresh.Extra) > 0 {
+			files[idx].t.Extra = mergeExtra(fresh.Extra, files[idx].t.Extra)
+		}
+	}
+}
+
+// putOptions materializes one file's PUT option set from the batch
+// surface: item bootstrap (AutoMakeBucket + SizeHint) on the first PUT,
+// QueueDerive on the last, and the per-target metadata overlay
+// (--auto-meta, Task 14): non-empty Title/Description override, Extra
+// values append after the batch values for the same names.
+func (r *UploadRunner) putOptions(o ias3.HeaderOpts, it *uploadItem, f *uploadFile) ias3.HeaderOpts {
+	opt := o
+
+	opt.AutoMakeBucket = f.bootstrap
+	if f.bootstrap {
+		opt.SizeHint = it.totalBytes
+	} else {
+		opt.SizeHint = 0
+	}
+
+	opt.QueueDerive = o.QueueDerive && f.lastInPlan
+
+	if f.t.Title != "" {
+		opt.Title = f.t.Title
+	}
+
+	if f.t.Description != "" {
+		opt.Description = f.t.Description
+	}
+
+	if len(f.t.Extra) > 0 {
+		extra := make(ias3.Meta, len(o.Extra)+len(f.t.Extra))
+		for name, values := range o.Extra {
+			extra[name] = append(extra[name], values...)
+		}
+
+		for name, values := range f.t.Extra {
+			extra[name] = append(extra[name], values...)
+		}
+
+		opt.Extra = extra
+	}
+
+	return opt
 }
 
 // processItem runs one item's sequential chain: hash → skip-if-exists →
@@ -453,6 +609,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				}
 
 				r.failFile(events, c, f, "skip-check", err.Error())
+
 				continue
 			}
 
@@ -464,6 +621,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 					}
 
 					r.failFile(events, c, f, "skip-guard", fmt.Sprintf("не удалось проверить активные задачи item — пропуск недостоверен: %v", err))
+
 					continue
 				}
 
@@ -531,16 +689,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		// Stage 4: the PUT. ias3.Upload owns the SlowDown retry budget;
 		// a returned error is terminal here and the next run restarts
 		// the file from byte 0 (no resume exists server-side).
-		opt := o
-
-		opt.AutoMakeBucket = f.bootstrap
-		if f.bootstrap {
-			opt.SizeHint = it.totalBytes
-		} else {
-			opt.SizeHint = 0
-		}
-
-		opt.QueueDerive = o.QueueDerive && f.lastInPlan
+		opt := r.putOptions(o, &it, f)
 
 		size := f.rec.Size
 		thr := &progressThrottle{total: size}
@@ -596,6 +745,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				}
 
 				r.failFile(events, c, f, "verify", err.Error())
+
 				continue
 			}
 		}
@@ -701,6 +851,11 @@ func (r *UploadRunner) persist(f *uploadFile, st journal.State) error {
 		m.Size = f.rec.Size
 		m.ErrKind = f.rec.ErrKind
 		m.ErrMsg = f.rec.ErrMsg
+		// Per-target metadata (--auto-meta): set once at record creation,
+		// carried through every persist so a resume rebuilds the PUT.
+		m.Title = f.rec.Title
+		m.Description = f.rec.Description
+		m.Extra = f.rec.Extra
 	})
 	if err == nil {
 		f.rec.State = st

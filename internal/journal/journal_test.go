@@ -39,6 +39,29 @@ func testRecord(kind Kind, target string) *Record {
 	}
 }
 
+// TestPutGetRoundTripTargetMeta: the per-target item metadata (--auto-meta,
+// fix round 2) survives the journal round trip — add-fields-only gob
+// evolution per the T9 policy, SchemaVersion stays 1.
+func TestPutGetRoundTripTargetMeta(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	r := testRecord(KindUpload, "/docs/01_a_topic.pdf\x00testid-meta01/01_a_topic.pdf")
+	r.Title = "Derived Title"
+	r.Description = "Derived description"
+	r.Extra = map[string][]string{"subject": {"athens", "aristophanes frogs"}, "language": {"rus"}}
+
+	require.NoError(t, store.Put(r))
+
+	got, found, err := store.Get(KindUpload, r.Target)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "Derived Title", got.Title)
+	assert.Equal(t, "Derived description", got.Description)
+	assert.Equal(t, map[string][]string{"subject": {"athens", "aristophanes frogs"}, "language": {"rus"}}, got.Extra)
+	assert.Equal(t, uint8(1), got.SchemaVersion, "add-fields evolution must not bump the schema")
+}
+
 func TestPutGetRoundTrip(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
