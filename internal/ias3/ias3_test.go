@@ -397,7 +397,7 @@ func TestNoChunkedEncoding(t *testing.T) {
 	assert.Equal(t, content, string(capReq.body))
 }
 
-// --- CheckLimit / awaitNotOverLimit ---------------------------------------
+// --- CheckLimit / AwaitNotOverLimit ----------------------------------------
 
 func TestCheckLimitOverLimit(t *testing.T) {
 	var query []string
@@ -467,7 +467,7 @@ func TestUpload503BudgetExhausted(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, s3Err.StatusCode)
 }
 
-// --- awaitNotOverLimit poll loop ------------------------------------------
+// --- AwaitNotOverLimit poll loop -------------------------------------------
 
 func TestAwaitNotOverLimitPolls(t *testing.T) {
 	shrinkPacing(t)
@@ -483,7 +483,7 @@ func TestAwaitNotOverLimitPolls(t *testing.T) {
 	})
 	cl, _ := newTestClient(t, h)
 
-	err := awaitNotOverLimit(context.Background(), cl, "testid1")
+	err := AwaitNotOverLimit(context.Background(), cl, "testid1")
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, checks, 3, "must poll until the limit clears")
 
@@ -494,7 +494,7 @@ func TestAwaitNotOverLimitPolls(t *testing.T) {
 	cl2, _ := newTestClient(t, h2)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err = awaitNotOverLimit(ctx, cl2, "testid1")
+	err = AwaitNotOverLimit(ctx, cl2, "testid1")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded), "ctx deadline must surface, got: %v", err)
 }
