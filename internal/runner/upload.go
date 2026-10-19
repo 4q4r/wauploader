@@ -165,10 +165,18 @@ func (p *progressThrottle) emit(sent int64) bool {
 
 // UploadTarget is one file bound for one IA item. Key defaults to the
 // file's base name; Identifier is required.
+//
+// Per-target item metadata (--auto-meta, Task 14): a non-empty Title or
+// Description overrides the batch HeaderOpts value on THIS file's PUTs,
+// and Extra values append after the batch Extra values for the same
+// names (batch first, derived second). Zero-value fields change nothing.
 type UploadTarget struct {
-	Path       string
-	Identifier string
-	Key        string
+	Path        string
+	Identifier  string
+	Key         string
+	Title       string
+	Description string
+	Extra       ias3.Meta
 }
 
 // UploadRunner drives the upload pipeline over one ias3 client and one
@@ -401,6 +409,47 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 	return items, nil
 }
 
+// putOptions materializes one file's PUT option set from the batch
+// surface: item bootstrap (AutoMakeBucket + SizeHint) on the first PUT,
+// QueueDerive on the last, and the per-target metadata overlay
+// (--auto-meta, Task 14): non-empty Title/Description override, Extra
+// values append after the batch values for the same names.
+func (r *UploadRunner) putOptions(o ias3.HeaderOpts, it *uploadItem, f *uploadFile) ias3.HeaderOpts {
+	opt := o
+
+	opt.AutoMakeBucket = f.bootstrap
+	if f.bootstrap {
+		opt.SizeHint = it.totalBytes
+	} else {
+		opt.SizeHint = 0
+	}
+
+	opt.QueueDerive = o.QueueDerive && f.lastInPlan
+
+	if f.t.Title != "" {
+		opt.Title = f.t.Title
+	}
+
+	if f.t.Description != "" {
+		opt.Description = f.t.Description
+	}
+
+	if len(f.t.Extra) > 0 {
+		extra := make(ias3.Meta, len(o.Extra)+len(f.t.Extra))
+		for name, values := range o.Extra {
+			extra[name] = append(extra[name], values...)
+		}
+
+		for name, values := range f.t.Extra {
+			extra[name] = append(extra[name], values...)
+		}
+
+		opt.Extra = extra
+	}
+
+	return opt
+}
+
 // processItem runs one item's sequential chain: hash → skip-if-exists →
 // preflight → PUT → verify per file, then the per-item derive watch.
 func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.HeaderOpts, verify, skipExisting bool, events chan<- Event, c *counters, paused *atomic.Bool, authOnce *sync.Once, authErr *error) { //nolint:gocognit,gocyclo // per-file state machine: preflight/skip/PUT/verify branches mirror the wire; 72 gocognit / 34 gocyclo vs caps 30/20
@@ -453,6 +502,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				}
 
 				r.failFile(events, c, f, "skip-check", err.Error())
+
 				continue
 			}
 
@@ -464,6 +514,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 					}
 
 					r.failFile(events, c, f, "skip-guard", fmt.Sprintf("не удалось проверить активные задачи item — пропуск недостоверен: %v", err))
+
 					continue
 				}
 
@@ -531,16 +582,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		// Stage 4: the PUT. ias3.Upload owns the SlowDown retry budget;
 		// a returned error is terminal here and the next run restarts
 		// the file from byte 0 (no resume exists server-side).
-		opt := o
-
-		opt.AutoMakeBucket = f.bootstrap
-		if f.bootstrap {
-			opt.SizeHint = it.totalBytes
-		} else {
-			opt.SizeHint = 0
-		}
-
-		opt.QueueDerive = o.QueueDerive && f.lastInPlan
+		opt := r.putOptions(o, &it, f)
 
 		size := f.rec.Size
 		thr := &progressThrottle{total: size}
@@ -596,6 +638,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				}
 
 				r.failFile(events, c, f, "verify", err.Error())
+
 				continue
 			}
 		}
