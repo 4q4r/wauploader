@@ -823,3 +823,101 @@ func TestEmptyInputGuards(t *testing.T) {
 		t.Error("StatusOutlinks with an empty parent id must fail fast")
 	}
 }
+
+// TestProbeNon2xxTypedError pins the review round-1 fix: the read-only
+// probes (Status, StatusBatch, StatusOutlinks, UserStatus) must never
+// return a parsed document with a nil error for a non-2xx transport
+// status — a 401 must reach the runner's auth-pause path, not
+// terminal-fail or spin. 401/403 are not retried by the idempotent
+// ladder, so they surface as typed *spn2.Error; 429/5xx are ladder-
+// retried and end in the budget-exceeded error, which still honors the
+// never-a-zero-error-doc invariant (the runner classifies it fail-open
+// retryable, identical net behavior to KindRetryable). Body content
+// like a job's target http_status is unaffected: only the HTTP
+// transport status gates here.
+func TestProbeNon2xxTypedError(t *testing.T) {
+	cases := []struct {
+		code  int
+		kind  Kind
+		typed bool
+	}{
+		{http.StatusUnauthorized, KindTerminal, true},
+		{http.StatusForbidden, KindTerminal, true},
+		{http.StatusTooManyRequests, KindRetryable, false},
+		{http.StatusInternalServerError, KindRetryable, false},
+	}
+	for _, tc := range cases {
+		t.Run(strconv.Itoa(tc.code), func(t *testing.T) {
+			fake := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(`{"status":"error","status_ext":"error:unauthorized"}`))
+			})
+			c := newTestClient(auth.Credentials{Access: "a", Secret: "b"})
+			// Shrink the idempotent ladder so the retryable cases stay
+			// fast while keeping the retry semantics.
+			c.retry = httpx.RetryOpts{Mode: httpx.RetryIdempotent, MaxAttempts: 2, BaseWait: time.Millisecond, MaxWait: 2 * time.Millisecond}
+
+			_, err := c.Status(context.Background(), "job-1")
+			if err == nil {
+				t.Fatalf("Status returned a document for HTTP %d", tc.code)
+			}
+			var spnErr *Error
+			if tc.typed {
+				if !errors.As(err, &spnErr) {
+					t.Fatalf("error type = %T, want *spn2.Error", err)
+				}
+				if spnErr.HTTP != tc.code || spnErr.Kind != tc.kind {
+					t.Errorf("error = HTTP %d kind %v, want HTTP %d kind %v", spnErr.HTTP, spnErr.Kind, tc.code, tc.kind)
+				}
+				if !strings.Contains(spnErr.Message, "SPN2 вернул HTTP") {
+					t.Errorf("error Message = %q, want the Russian transport notice", spnErr.Message)
+				}
+			} else if !errors.Is(err, httpx.ErrRetryBudgetExceeded) {
+				t.Fatalf("error = %v, want the retry budget sentinel", err)
+			}
+
+			if _, _, uerr := c.UserStatus(context.Background()); uerr == nil {
+				t.Fatalf("UserStatus returned values for HTTP %d", tc.code)
+			}
+			if _, berr := c.StatusBatch(context.Background(), []string{"job-1"}); berr == nil {
+				t.Fatalf("StatusBatch returned documents for HTTP %d", tc.code)
+			}
+			if _, oerr := c.StatusOutlinks(context.Background(), "job-1"); oerr == nil {
+				t.Fatalf("StatusOutlinks returned documents for HTTP %d", tc.code)
+			}
+			_ = fake.count()
+		})
+	}
+}
+
+// TestProbeTransportErrorKinds pins the probeTransportError mapping and
+// its bounded Russian message for every transport class, including the
+// codes the retry ladder would otherwise consume.
+func TestProbeTransportErrorKinds(t *testing.T) {
+	cases := []struct {
+		code int
+		kind Kind
+	}{
+		{http.StatusUnauthorized, KindTerminal},
+		{http.StatusForbidden, KindTerminal},
+		{http.StatusTooManyRequests, KindRetryable},
+		{http.StatusInternalServerError, KindRetryable},
+		{http.StatusBadGateway, KindRetryable},
+	}
+	for _, tc := range cases {
+		err := probeTransportError(tc.code, "статуса задания", []byte("boom body"))
+		if err.Kind != tc.kind {
+			t.Errorf("code %d: kind = %v, want %v", tc.code, err.Kind, tc.kind)
+		}
+		if err.HTTP != tc.code {
+			t.Errorf("code %d: HTTP = %d", tc.code, err.HTTP)
+		}
+		if !strings.Contains(err.Message, "SPN2 вернул HTTP") || !strings.Contains(err.Message, "boom body") {
+			t.Errorf("code %d: message = %q, want the Russian notice with the body snippet", tc.code, err.Message)
+		}
+		if len(err.Message) > 220 {
+			t.Errorf("code %d: message %q exceeds the 200-rune body bound", tc.code, err.Message)
+		}
+	}
+}

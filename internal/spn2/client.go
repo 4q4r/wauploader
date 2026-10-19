@@ -194,7 +194,9 @@ func (c *Client) Submit(ctx context.Context, targetURL string, o Options) (Submi
 
 // Status reads one job's status document from GET /save/status/<job_id>.
 // An "error" job state is data, not a Go error: the caller inspects
-// State/StatusExt and classifies with the runner's policy.
+// State/StatusExt and classifies with the runner's policy. A non-2xx
+// transport status is a typed *Error — never a parsed document with a
+// nil error (a 401 must reach the runner's auth-pause path).
 func (c *Client) Status(ctx context.Context, jobID string) (Status, error) {
 	if jobID == "" {
 		return Status{}, errors.New("не указан идентификатор задания")
@@ -203,6 +205,9 @@ func (c *Client) Status(ctx context.Context, jobID string) (Status, error) {
 	code, data, err := c.doForm(ctx, http.MethodGet, endpoint, nil, c.retry)
 	if err != nil {
 		return Status{}, fmt.Errorf("получение статуса задания не выполнено: %w", err)
+	}
+	if !is2xx(code) {
+		return Status{}, probeTransportError(code, "статуса задания", data)
 	}
 	var st Status
 	if jerr := json.Unmarshal(data, &st); jerr != nil {
@@ -234,11 +239,15 @@ func (c *Client) StatusOutlinks(ctx context.Context, parentJobID string) ([]Stat
 
 // postStatusList POSTs a status query form and decodes the JSON array of
 // per-job status documents; the batch and outlinks forms answer with the
-// same payloads as the per-job endpoint.
+// same payloads as the per-job endpoint. Non-2xx transport statuses are
+// typed errors, like the per-job probe.
 func (c *Client) postStatusList(ctx context.Context, form url.Values) ([]Status, error) {
 	code, data, err := c.doForm(ctx, http.MethodPost, baseURL+"/status", form, c.retry)
 	if err != nil {
 		return nil, fmt.Errorf("получение статусов заданий не выполнено: %w", err)
+	}
+	if !is2xx(code) {
+		return nil, probeTransportError(code, "статусов заданий", data)
 	}
 	var sts []Status
 	if jerr := json.Unmarshal(data, &sts); jerr != nil {
@@ -259,6 +268,9 @@ func (c *Client) UserStatus(ctx context.Context) (available, processing int, err
 	code, data, err := c.doForm(ctx, http.MethodGet, endpoint, nil, c.retry)
 	if err != nil {
 		return 0, 0, fmt.Errorf("получение квоты сеансов не выполнено: %w", err)
+	}
+	if !is2xx(code) {
+		return 0, 0, probeTransportError(code, "квоты сеансов", data)
 	}
 	var payload struct {
 		Available  int `json:"available"`
@@ -466,6 +478,31 @@ func oneLine(data []byte) string {
 		return "(пустое тело ответа)"
 	}
 	return truncate(s)
+}
+
+// is2xx reports a successful HTTP transport status.
+func is2xx(code int) bool { return code/100 == 2 }
+
+// probeTransportError builds the typed error for a non-2xx transport
+// status on the read-only probes (Status, StatusBatch, StatusOutlinks,
+// UserStatus). These endpoints answer failures with readable JSON
+// bodies, so without this gate a caller would receive a parsed
+// document with a nil error and misfile the outcome — a 401 must reach
+// the runner's auth-pause path, not terminal-fail or spin. 401/403 are
+// terminal (resending cannot help without a credential change); 429
+// and 5xx are retryable; anything else is fail-open retryable. Body
+// content (a job's target http_status) is unaffected: only the
+// transport status gates.
+func probeTransportError(code int, what string, body []byte) *Error {
+	kind := KindRetryable
+	if code == http.StatusUnauthorized || code == http.StatusForbidden {
+		kind = KindTerminal
+	}
+	return &Error{
+		Kind:    kind,
+		HTTP:    code,
+		Message: fmt.Sprintf("SPN2 вернул HTTP %d для %s: %s", code, what, oneLine(body)),
+	}
 }
 
 // truncate caps s to 200 runes so error messages stay bounded.
