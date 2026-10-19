@@ -120,9 +120,13 @@ var statusExtKinds = map[string]Kind{
 	"service-unavailable":             KindTerminal,
 	"invalid-server-response":         KindTerminal,
 	"soft-time-limit-exceeded":        KindTerminal,
+	// too-many-redirects: SPN2 follows at most 3 redirects (r1 F4.1), so a
+	// looping target can never succeed and resubmitting only burns the
+	// 5-per-day-per-URL cap — terminal by controller ruling.
+	"too-many-redirects": KindTerminal,
 }
 
-// classifyStatusExt maps a wire status_ext value ("error:codel" or the
+// classifyStatusExt maps a wire status_ext value ("error:code" or the
 // bare code) to its kind. The second result is false for codes absent
 // from the documented taxonomy: SPN2 may add new codes at any time, and
 // the fail-open policy classifies those as retryable with a warning

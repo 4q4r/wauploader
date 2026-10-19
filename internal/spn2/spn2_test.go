@@ -242,6 +242,35 @@ func TestSubmitNoStatusRetry(t *testing.T) {
 	}
 }
 
+func TestSubmit429Propagates(t *testing.T) {
+	fake := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		// Per-minute cap reached: the answer must reach the caller as a
+		// typed error carrying HTTP 429 (pacing decisions belong to the
+		// runner), and POST /save must never be resent on a status.
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("429 Too Many Requests"))
+	})
+	c := newTestClient(auth.Credentials{Access: "testaccess", Secret: "testsecret"})
+
+	_, err := c.Submit(context.Background(), "https://example.com/", Options{})
+	if err == nil {
+		t.Fatal("Submit returned success for a 429 response")
+	}
+	var spnErr *Error
+	if !errors.As(err, &spnErr) {
+		t.Fatalf("error type = %T, want *spn2.Error", err)
+	}
+	if spnErr.HTTP != http.StatusTooManyRequests {
+		t.Errorf("error HTTP = %d, want 429", spnErr.HTTP)
+	}
+	if spnErr.Kind != KindRetryable {
+		t.Errorf("error Kind = %v, want KindRetryable (non-JSON 429 body is fail-open)", spnErr.Kind)
+	}
+	if fake.count() != 1 {
+		t.Errorf("request count = %d, want 1 (RetryConnectOnly never resends on a status response)", fake.count())
+	}
+}
+
 func TestSubmitCookieAuth(t *testing.T) {
 	body := loadFixture(t, "submit_success.json")
 	fake := newFake(t, func(w http.ResponseWriter, r *http.Request) {
@@ -528,7 +557,7 @@ func TestErrorClassification(t *testing.T) {
 		{"error:max-daily-bandwidth", KindQuota},
 		{"error:max-daily-bandwidth-from-ip", KindQuota},
 		{"error:max-daily-bandwidth-host", KindQuota},
-		// Terminal (21 documented codes).
+		// Terminal (22 documented codes).
 		{"error:blocked-url", KindTerminal},
 		{"error:blocked", KindTerminal},
 		{"error:blocked-client-ip", KindTerminal},
@@ -550,6 +579,7 @@ func TestErrorClassification(t *testing.T) {
 		{"error:service-unavailable", KindTerminal},
 		{"error:invalid-server-response", KindTerminal},
 		{"error:soft-time-limit-exceeded", KindTerminal},
+		{"error:too-many-redirects", KindTerminal},
 	}
 	for _, tc := range cases {
 		kind, known := classifyStatusExt(tc.code)
@@ -693,13 +723,17 @@ func TestSystemStatusCritical502(t *testing.T) {
 			_, _ = w.Write([]byte("Bad Gateway"))
 		})
 		c := newTestClient(auth.Credentials{Access: "testaccess", Secret: "testsecret"})
-		// Single attempt: the caller polls system status on a schedule;
-		// a 502 must surface immediately, not after a retry storm.
-		c.retry = httpx.RetryOpts{Mode: httpx.RetryIdempotent, MaxAttempts: 1}
 
 		ok, overloaded, err := c.SystemStatus(context.Background())
 		if err == nil {
 			t.Fatalf("SystemStatus on 502 = (ok=%v, overloaded=%v, nil error), want a critical error", ok, overloaded)
+		}
+		var spnErr *Error
+		if !errors.As(err, &spnErr) {
+			t.Fatalf("error type = %T, want *spn2.Error (the 502 must surface typed, not as a transport error)", err)
+		}
+		if spnErr.HTTP != http.StatusBadGateway {
+			t.Errorf("error HTTP = %d, want 502", spnErr.HTTP)
 		}
 		if ok || overloaded {
 			t.Errorf("ok = %v, overloaded = %v, want both false on error", ok, overloaded)
@@ -709,6 +743,31 @@ func TestSystemStatusCritical502(t *testing.T) {
 		}
 		if fake.count() != 1 {
 			t.Errorf("request count = %d, want 1 (502 surfaces without a retry storm)", fake.count())
+		}
+	})
+
+	t.Run("502 with a JSON body must not read as overloaded", func(t *testing.T) {
+		newFake(t, func(w http.ResponseWriter, r *http.Request) {
+			// A 502 is critical by HTTP status alone: even a body that
+			// parses as "ok" must not become the overload notice.
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		})
+		c := newTestClient(auth.Credentials{Access: "testaccess", Secret: "testsecret"})
+
+		ok, overloaded, err := c.SystemStatus(context.Background())
+		if err == nil {
+			t.Fatalf("SystemStatus on 502 with a JSON body = (ok=%v, overloaded=%v, nil error), want a status-driven critical error", ok, overloaded)
+		}
+		var spnErr *Error
+		if !errors.As(err, &spnErr) {
+			t.Fatalf("error type = %T, want *spn2.Error", err)
+		}
+		if spnErr.HTTP != http.StatusBadGateway {
+			t.Errorf("error HTTP = %d, want 502", spnErr.HTTP)
+		}
+		if ok || overloaded {
+			t.Errorf("ok = %v, overloaded = %v, want both false: 502 is status-driven critical, not the overload notice", ok, overloaded)
 		}
 	})
 

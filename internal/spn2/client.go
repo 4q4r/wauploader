@@ -58,12 +58,13 @@ type Client struct {
 	Creds auth.Credentials
 	// retry is the ladder for the read-only status endpoints. Submit
 	// never consults it: its mode is pinned to httpx.RetryConnectOnly
-	// for capture safety.
+	// for capture safety, and SystemStatus pins RetryNone so the HTTP
+	// 502 critical signal reaches the caller.
 	retry httpx.RetryOpts
 }
 
 // NewClient wires the HTTP client and credentials into an SPN2 client.
-// The status endpoints use the default idempotent retry ladder.
+// The job status endpoints use the default idempotent retry ladder.
 func NewClient(cl *httpx.Client, creds auth.Credentials) *Client {
 	return &Client{HTTP: cl, Creds: creds, retry: httpx.DefaultRetryOpts()}
 }
@@ -275,13 +276,21 @@ func (c *Client) UserStatus(ctx context.Context) (available, processing int, err
 
 // SystemStatus probes the service health endpoint. The documented
 // "ok" answer reports (true, false); any other parseable answer is the
-// overload notice and reports (false, true). A transport failure or the
-// documented HTTP 502 critical signal returns a non-nil error naming the
-// status — the runner pauses captures, it does not parse booleans.
+// overload notice and reports (false, true). The probe sends a single
+// attempt: the runner polls health on a schedule, and the documented
+// HTTP 502 critical signal must reach the status-driven check below —
+// never be consumed by the retry ladder or inferred from the body.
 func (c *Client) SystemStatus(ctx context.Context) (ok bool, overloaded bool, err error) {
-	code, data, err := c.doForm(ctx, http.MethodGet, baseURL+"/status/system", nil, c.retry)
+	code, data, err := c.doForm(ctx, http.MethodGet, baseURL+"/status/system", nil, httpx.RetryOpts{Mode: httpx.RetryNone})
 	if err != nil {
 		return false, false, fmt.Errorf("проверка состояния службы не выполнена: %w", err)
+	}
+	if code == http.StatusBadGateway {
+		return false, false, &Error{
+			Kind:    KindRetryable,
+			HTTP:    code,
+			Message: "служба SPN2 в критическом состоянии",
+		}
 	}
 	var payload struct {
 		Status string `json:"status"`
