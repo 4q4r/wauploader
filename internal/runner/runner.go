@@ -55,8 +55,10 @@ const (
 )
 
 // Validate enforces the numeric [limits] bounds (T2 ruling: the
-// runner owns them, config only parses). The first violated rule
-// comes back as a Russian fail-fast error naming the key.
+// runner owns them, config only parses). Zero poll fields apply the
+// documented defaults — the TOML has no poll keys, so a preflight on
+// config-derived limits must pass. The first violated rule comes back
+// as a Russian fail-fast error naming the key.
 func (l Limits) Validate() error {
 	if l.PerMinute <= 0 {
 		return fmt.Errorf("save_per_minute должен быть не меньше 1 (сейчас %v)", l.PerMinute)
@@ -70,11 +72,15 @@ func (l Limits) Validate() error {
 	if l.JobWait <= 0 {
 		return errors.New("job_wait должен быть положительным (например \"20m\")")
 	}
-	if l.PollStart <= 0 {
-		return errors.New("poll_start должен быть положительным")
+	pollStart, pollMax := l.PollStart, l.PollMax
+	if pollStart <= 0 {
+		pollStart = defaultPollStart
 	}
-	if l.PollMax < l.PollStart {
-		return fmt.Errorf("poll_max (%v) должен быть не меньше poll_start (%v)", l.PollMax, l.PollStart)
+	if pollMax <= 0 {
+		pollMax = defaultPollMax
+	}
+	if pollMax < pollStart {
+		return fmt.Errorf("poll_max (%v) должен быть не меньше poll_start (%v)", pollMax, pollStart)
 	}
 	return nil
 }

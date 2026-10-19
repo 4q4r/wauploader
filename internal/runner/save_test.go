@@ -142,6 +142,15 @@ func (f *fakeSPN2) userCount() int {
 	return f.userPolls
 }
 
+// pollCount reports how many times the status endpoint was hit for a
+// job. Handlers write the maps under f.mu; tests must read through
+// this accessor to stay race-clean.
+func (f *fakeSPN2) pollCount(jobID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pollsByJob[jobID]
+}
+
 func (f *fakeSPN2) count(m map[string]int, k string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -303,7 +312,7 @@ func TestPendingPollsUntilSuccess(t *testing.T) {
 	rec := mustRecord(t, st, target)
 	require.Equal(t, journal.StateDone, rec.State)
 	require.Equal(t, "https://web.archive.org/web/20260119120000/https://example.com/", rec.SnapshotURL)
-	require.GreaterOrEqual(t, f.pollsByJob["job-1"], 3, "job must be polled until success")
+	require.GreaterOrEqual(t, f.pollCount("job-1"), 3, "job must be polled until success")
 }
 
 func TestStallDetectionDownloadSizePlateau(t *testing.T) {
@@ -323,7 +332,7 @@ func TestStallDetectionDownloadSizePlateau(t *testing.T) {
 
 	// The plateau of three identical nonzero sizes must stop the poll
 	// loop at the third identical reading, not run to JobWait.
-	require.LessOrEqual(t, f.pollsByJob["job-1"], 4)
+	require.LessOrEqual(t, f.pollCount("job-1"), 4)
 	found := false
 	for _, ev := range events {
 		if ev.State == journal.StateFailed && ev.Target == target {
@@ -403,7 +412,7 @@ func TestSubmitRefusalTerminalJournaled(t *testing.T) {
 	require.Equal(t, journal.StateFailed, rec.State)
 	require.Equal(t, "terminal", rec.ErrKind)
 	require.Contains(t, rec.ErrMsg, "error:blocked-url")
-	require.Zero(t, f.pollsByJob["job-1"], "a refused target must never be polled")
+	require.Zero(t, f.pollCount("job-1"), "a refused target must never be polled")
 }
 
 func TestResumeSkipsDoneAndPollsPending(t *testing.T) {
@@ -475,7 +484,8 @@ func TestPerHostLimiterCapsConcurrency(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, Summary{Done: 5}, sum)
 
-	_, maxInflight := f.snapshot()
+	submits, maxInflight := f.snapshot()
+	require.Equal(t, 5, submits, "every target must be submitted exactly once")
 	require.LessOrEqual(t, maxInflight, 2, "per-host cap must bound simultaneous captures")
 	require.GreaterOrEqual(t, maxInflight, 2, "cap of 2 must actually allow overlap (otherwise the test proves nothing)")
 }
@@ -672,7 +682,7 @@ func TestChaos502StormRecovers(t *testing.T) {
 	rec := mustRecord(t, st, target)
 	require.Equal(t, journal.StateDone, rec.State)
 	require.Equal(t, 2, rec.Attempts, "two failed submits must be journaled in the Attempts counter")
-	require.Equal(t, 3, f.submitsByTarget[target], "the runner must resubmit until the storm passes")
+	require.Equal(t, 3, f.count(f.submitsByTarget, target), "the runner must resubmit until the storm passes")
 }
 
 func TestLimitsValidate(t *testing.T) {
@@ -703,6 +713,11 @@ func TestLimitsValidate(t *testing.T) {
 	noWait := base
 	noWait.JobWait = 0
 	require.ErrorContains(t, noWait.Validate(), "job_wait")
+
+	// Zero poll fields apply the documented defaults: the T12 preflight
+	// on config-derived limits (the TOML has no poll keys) must pass.
+	noPoll := Limits{PerMinute: rate.Inf, Concurrency: 4, PerHost: 3, JobWait: time.Second}
+	require.NoError(t, noPoll.Validate())
 
 	badPoll := base
 	badPoll.PollStart = time.Second
