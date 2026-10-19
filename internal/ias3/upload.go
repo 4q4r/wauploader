@@ -414,7 +414,7 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 		return errors.New("загрузка невозможна: s3_access или s3_secret не заданы в конфигурации")
 	}
 
-	if err := validateExtraMeta(o.Extra); err != nil {
+	if err := ValidateExtraMeta(o.Extra); err != nil {
 		return err
 	}
 

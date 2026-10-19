@@ -146,6 +146,8 @@ type fakeBackend struct {
 	saves         int
 	puts          int
 	putPaths      []string
+	putHeaders    []http.Header // last PUT's headers per call order
+	tasksCalls    int           // tasks.php call counter (baseline → newer derive)
 	nextJob       int
 	jobTargets    map[string]string
 	failTargets   map[string]bool
@@ -322,6 +324,7 @@ func (fb *fakeBackend) handleS3(w http.ResponseWriter, r *http.Request) {
 		fb.mu.Lock()
 		fb.puts++
 		fb.putPaths = append(fb.putPaths, r.URL.Path)
+		fb.putHeaders = append(fb.putHeaders, r.Header.Clone())
 		fb.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		return
@@ -335,8 +338,14 @@ func (fb *fakeBackend) handleMetadata(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (fb *fakeBackend) handleTasks(w http.ResponseWriter, _ *http.Request) {
+	// A derive task whose id GROWS per call: the first call captures the
+	// derive baseline, later watch calls see a newer id = completed.
+	fb.mu.Lock()
+	fb.tasksCalls++
+	n := fb.tasksCalls
+	fb.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = io.WriteString(w, `{"value":{"catalog":[],"history":[]}}`)
+	_, _ = fmt.Fprintf(w, `{"success":true,"value":{"catalog":[],"history":[{"task_id":%d,"cmd":"derive.php"}]}}`, 10+n)
 }
 
 // --- shared assertions -------------------------------------------------------

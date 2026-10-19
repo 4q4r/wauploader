@@ -17,6 +17,7 @@ import (
 	"github.com/4q4r/wauploader/internal/console"
 	"github.com/4q4r/wauploader/internal/ias3"
 	"github.com/4q4r/wauploader/internal/journal"
+	"github.com/4q4r/wauploader/internal/pdfmeta"
 	"github.com/4q4r/wauploader/internal/runner"
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -40,7 +41,14 @@ type uploadFlags struct {
 	waitDerive              bool
 	checksumSkip            bool
 	identifierFrom          string
+	autoMeta                bool
+	identifierScheme        string
 }
+
+// schemeDirNNSlug is the only supported --identifier-scheme value: the
+// <dir>-<NN>-<slug> scheme derived from the file's parent directory and
+// the NN_author_topic_words.pdf filename convention (pdfmeta.Identifier).
+const schemeDirNNSlug = "dir-nn-slug"
 
 // parseMetaFlags parses repeatable --meta NAME=VALUE pairs into the Extra
 // metadata map (repeated names accumulate values).
@@ -122,6 +130,187 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 	return targets, nil
 }
 
+// uploadTargetsOrAutoMeta resolves the upload targets for the two
+// identifier modes: the explicit --item/--identifier-from contract
+// (uploadTargetsFrom) or --auto-meta (targets built later from the PDFs
+// themselves — here only the flag contract is enforced). Every violation
+// is a usage error (exit 2).
+func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTarget, error) {
+	if f.identifierScheme != "" && f.identifierScheme != schemeDirNNSlug {
+		return nil, errors.New("недопустимое значение --identifier-scheme: поддерживается только dir-nn-slug")
+	}
+
+	if f.autoMeta {
+		if f.identifierScheme == "" {
+			return nil, errors.New("--auto-meta требует --identifier-scheme dir-nn-slug (единственная поддерживаемая схема идентификаторов)")
+		}
+
+		for _, conflict := range []struct {
+			flag, value string
+		}{
+			{"--item", f.item},
+			{"--identifier-from", f.identifierFrom},
+			{"--key", f.key},
+		} {
+			if conflict.value != "" {
+				return nil, errors.New(conflict.flag + " несовместим с --auto-meta: идентификаторы и ключи вычисляются из имён файлов")
+			}
+		}
+
+		return nil, nil // the real targets are derived later, after the cheap checks
+	}
+
+	if f.identifierScheme != "" {
+		return nil, errors.New("--identifier-scheme допустим только вместе с --auto-meta")
+	}
+
+	return uploadTargetsFrom(paths, f)
+}
+
+// deriveAutoMetaTargets derives targets and metadata from the PDFs and
+// announces each derived identifier + title in human-readable mode. The
+// returned error is already exit-classified: duplicate identifiers are a
+// usage error (exit 2 — silent item-merge is worse), while convention and
+// poppler failures are data errors of the file set (exit 1, review ruling
+// of fix round 1).
+func deriveAutoMetaTargets(con *console.Console, paths []string, jsonOut bool) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
+	targets, metas, err := uploadAutoMetaTargets(paths)
+	if err != nil {
+		var dup *duplicateIdentifierError
+		if errors.As(err, &dup) {
+			return nil, nil, exitUsage("%v", err)
+		}
+
+		return nil, nil, &ExitError{Code: ExitSomeFailed, Err: err}
+	}
+
+	if !jsonOut {
+		for idx, t := range targets {
+			con.Infof("Автометаданные: %s → %s «%s»", t.Path, t.Identifier, metas[idx].Title)
+		}
+	}
+
+	return targets, metas, nil
+}
+
+// duplicateIdentifierError marks an --auto-meta batch whose files collide
+// on one derived identifier — uploading it would silently merge items.
+type duplicateIdentifierError struct {
+	Identifier string
+	First      string
+	Second     string
+}
+
+func (e *duplicateIdentifierError) Error() string {
+	return "повторяющийся идентификатор «" + e.Identifier + "»: элементы сольются — " +
+		e.First + " и " + e.Second + "; переименуйте один из файлов"
+}
+
+// printDryRunDetail renders one file's complete derived plan for the
+// dry-run review surface: title, creator, collection, language, year,
+// subjects and a description head.
+func printDryRunDetail(con *console.Console, meta pdfmeta.Meta, collection string) {
+	detail := "Название: «" + meta.Title + "»"
+	if meta.Creator != "" {
+		detail += " · Автор: " + meta.Creator
+	}
+
+	detail += " · Коллекция: " + collection
+
+	if meta.Language != "" {
+		detail += " · Язык: " + meta.Language
+	}
+
+	if meta.Year != "" {
+		detail += " · Год: " + meta.Year
+	}
+
+	if len(meta.Subjects) > 0 {
+		detail += " · Темы: " + strings.Join(meta.Subjects, ", ")
+	}
+
+	con.Dimf("    %s", detail)
+
+	if head := descriptionHead(meta.Description); head != "" {
+		con.Dimf("    Описание: %s", head)
+	}
+}
+
+// descriptionHead cuts the derived description to a 60-char preview head
+// for the dry-run plan line (ellipsis marks the cut).
+func descriptionHead(d string) string {
+	head := d
+	if len([]rune(d)) > 60 {
+		head = string([]rune(d)[:60]) + "…"
+	}
+
+	return strings.TrimRight(head, " ")
+}
+
+// uploadAutoMetaTargets derives the targets and item metadata from the
+// PDFs themselves: pdfmeta.DeriveMeta for the metadata, pdfmeta.Identifier
+// for the dir-nn-slug scheme. Subjects/language/year land in the per-target
+// Extra; Title/Description ride the target-level overrides.
+func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
+	targets := make([]runner.UploadTarget, 0, len(paths))
+	metas := make([]pdfmeta.Meta, 0, len(paths))
+	seenIDs := make(map[string]string, len(paths)) // identifier → first path
+
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return nil, nil, errors.New("не удалось определить путь " + p + ": " + err.Error())
+		}
+
+		dirName := filepath.Base(filepath.Dir(abs))
+
+		meta, err := pdfmeta.DeriveMeta(abs, dirName)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		id, err := pdfmeta.Identifier(dirName, filepath.Base(abs))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if prev, seen := seenIDs[id]; seen {
+			return nil, nil, &duplicateIdentifierError{Identifier: id, First: prev, Second: abs}
+		}
+
+		seenIDs[id] = abs
+
+		extra := ias3.Meta{}
+		if len(meta.Subjects) > 0 {
+			extra["subject"] = meta.Subjects
+		}
+
+		if meta.Language != "" {
+			extra["language"] = []string{meta.Language}
+		}
+
+		if meta.Year != "" {
+			extra["year"] = []string{meta.Year}
+		}
+
+		if meta.Creator != "" {
+			extra["creator"] = []string{meta.Creator}
+		}
+
+		targets = append(targets, runner.UploadTarget{
+			Path:        abs,
+			Identifier:  id,
+			Key:         filepath.Base(abs),
+			Title:       meta.Title,
+			Description: meta.Description,
+			Extra:       extra,
+		})
+		metas = append(metas, meta)
+	}
+
+	return targets, metas, nil
+}
+
 // headerOptsFrom builds the IA-S3 header surface from configuration and
 // flags. Collection/mediatype come from configuration (already merged with
 // flags and validated); the control booleans combine the configuration
@@ -134,6 +323,13 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 func headerOptsFrom(cfg *config.Config, f *uploadFlags) (ias3.HeaderOpts, error) {
 	meta, err := parseMetaFlags(f.meta)
 	if err != nil {
+		return ias3.HeaderOpts{}, err
+	}
+
+	// Names are validated here, at flag-parse time, so a malformed
+	// --meta name is a usage error before any per-file work (poppler
+	// extraction, hashing) — never a late per-file failure.
+	if err := ias3.ValidateExtraMeta(meta); err != nil {
 		return ias3.HeaderOpts{}, err
 	}
 
@@ -197,6 +393,10 @@ func NewUploadCommand(configPath, journalPath *string, jsonOut, noColor, dryRun 
 	fs.BoolVar(&f.checksumSkip, "checksum-skip", false, "не пропускать файлы, уже присутствующие в элементе с тем же MD5")
 	fs.StringVar(&f.identifierFrom, "identifier-from", "",
 		"шаблон идентификатора для каждого файла, например \"custom-{{.Base}}\" (взаимоисключим с --item)")
+	fs.BoolVar(&f.autoMeta, "auto-meta", false,
+		"вывести метаданные каждого PDF из самого файла (pdfinfo/pdftotext, poppler-utils): название, автор, год, описание, темы, язык; требует poppler-utils и имена вида NN_автор_тема.pdf")
+	fs.StringVar(&f.identifierScheme, "identifier-scheme", "",
+		"схема идентификаторов при --auto-meta, единственное значение dir-nn-slug: <каталог>-<номер>-<имя-файла>")
 
 	return cmd
 }
@@ -215,7 +415,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 		return exitUsage("%v", err)
 	}
 
-	targets, err := uploadTargetsFrom(rawPaths, f)
+	targets, err := uploadTargetsOrAutoMeta(rawPaths, f)
 	if err != nil {
 		return exitUsage("%v", err)
 	}
@@ -255,13 +455,24 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 		return exitAuth(errors.New("загрузка в archive.org выполняется ключами S3: заполните s3_access и s3_secret в файле конфигурации (получить: https://archive.org/account/s3.php) или выполните wauploader init"))
 	}
 
+	// Cheap flag validation (incl. the --meta name contract) precedes
+	// the poppler work: a usage error must not be masked by a data
+	// error from per-file extraction.
 	opts, err := headerOptsFrom(cfg, f)
 	if err != nil {
 		return exitUsage("%v", err)
 	}
 
+	var derived []pdfmeta.Meta
+	if f.autoMeta {
+		targets, derived, err = deriveAutoMetaTargets(con, rawPaths, jsonOut)
+		if err != nil {
+			return err
+		}
+	}
+
 	if dryRun {
-		return runUploadDry(con, journalFlag, targets)
+		return runUploadDry(con, journalFlag, targets, derived, cfg.Upload.Collection)
 	}
 
 	jp, err := journalPathOr(journalFlag)
@@ -311,8 +522,10 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 }
 
 // runUploadDry resolves targets and journal skips without touching the
-// network or creating the journal file.
-func runUploadDry(con *console.Console, journalFlag string, targets []runner.UploadTarget) error {
+// network or creating the journal file. With --auto-meta the derived plan
+// shows identifier, title, collection and language per file — the review
+// surface the owner inspects before a live run.
+func runUploadDry(con *console.Console, journalFlag string, targets []runner.UploadTarget, derived []pdfmeta.Meta, collection string) error {
 	jp, err := journalPathOr(journalFlag)
 	if err != nil {
 		return err
@@ -326,7 +539,7 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 
 	skipped := 0
 
-	for _, t := range targets {
+	for idx, t := range targets {
 		composite := t.Path + "\x00" + t.Identifier + "/" + t.Key
 		if doneSet[composite] {
 			con.Dimf("Пропущено (уже в журнале): %s → %s/%s", t.Path, t.Identifier, t.Key)
@@ -337,6 +550,10 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 		}
 
 		con.Infof("Загрузить: %s → %s/%s", t.Path, t.Identifier, t.Key)
+
+		if idx < len(derived) {
+			printDryRunDetail(con, derived[idx], collection)
+		}
 	}
 
 	con.Infof("Итог dry-run: будет выполнено %d · пропущено %d", len(targets)-skipped, skipped)

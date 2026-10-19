@@ -70,7 +70,9 @@ type fakeIAS3 struct {
 	// blockPutUntilCancel / blockMetaUntilCancel make the PUT / metadata
 	// handler hang until the request context is cancelled — the mid-flight
 	// interrupt tests (cancel lands while the stage is in flight).
+	// blockPutKey narrows the PUT block to one key ("" = every PUT).
 	blockPutUntilCancel  bool
+	blockPutKey          string
 	blockMetaUntilCancel bool
 }
 
@@ -127,7 +129,7 @@ func (f *fakeIAS3) handlePut(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(f.holds)
 	}
 	f.mu.Lock()
-	blocked := f.blockPutUntilCancel
+	blocked := f.blockPutUntilCancel && (f.blockPutKey == "" || f.blockPutKey == key)
 	f.mu.Unlock()
 	if blocked {
 		select {
