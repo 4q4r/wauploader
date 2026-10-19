@@ -34,8 +34,16 @@ test: ## Все тесты: -race -p 2 -count=1 (GOTMPDIR вне общего /t
 vuln: ## govulncheck ./... — проверка зависимостей на известные уязвимости
 	govulncheck ./...
 
-gate: ## ПОЛНЫЙ ГЕЙТ = fmt → vet → lint → test → vuln, каждый шаг — отдельная блокирующая команда
-	$(MAKE) fmt
+check: ## Гейт форматирования: gofmt -l должен быть пуст; иначе список файлов и ошибка
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		printf '%s\n' "$$unformatted" >&2; \
+		echo "неотформатированные файлы — запустите make fmt" >&2; \
+		exit 1; \
+	fi
+
+gate: ## ПОЛНЫЙ ГЕЙТ = check → vet → lint → test → vuln, каждый шаг — отдельная блокирующая команда
+	$(MAKE) check
 	$(MAKE) vet
 	$(MAKE) lint
 	$(MAKE) test

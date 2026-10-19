@@ -62,7 +62,7 @@ make build          # → ./wauploader (CGO_ENABLED=0, статический)
 ### 2. Авторизация
 
 ```sh
-wauploader init
+./wauploader init
 ```
 
 Интерактивно спросит email и пароль archive.org, обменяет их на ключи S3 и куки входа (эндпоинт `xauthn`) и запишет в `~/.config/wauploader/wauploader.toml` с правами 0600. Пароль не сохраняется. Ключи S3 можно вписать и вручную — они генерируются на <https://archive.org/account/s3.php>.
@@ -70,14 +70,14 @@ wauploader init
 ### 3. Первое сохранение
 
 ```sh
-wauploader save https://example.com https://example.org/page
-wauploader save --list urls.txt --if-not-archived-within "3d 5h 20m"
+./wauploader save https://example.com https://example.org/page
+./wauploader save --list urls.txt --if-not-archived-within "3d 5h 20m"
 ```
 
 ### 4. Первая загрузка
 
 ```sh
-wauploader upload dump.tar.gz \
+./wauploader upload dump.tar.gz \
   --item my-dump-2026 --collection test_collection --mediatype data \
   --title "Мой дамп" --verify --wait-derive
 ```
