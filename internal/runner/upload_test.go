@@ -61,8 +61,11 @@ type fakeIAS3 struct {
 	// putFn overrides the PUT status per (identifier, key, nth-put-for-key);
 	// nil = always 200. taskFn overrides the tasks.php body per
 	// (identifier, nth-call); nil = a derive that completes immediately.
-	putFn  func(identifier, key string, nth int) int
-	taskFn func(identifier string, nth int) string
+	// failChecks makes the check_limit endpoint answer 501 (non-retryable
+	// for the httpx ladder) — the stalled-queue preflight path.
+	putFn      func(identifier, key string, nth int) int
+	taskFn     func(identifier string, nth int) string
+	failChecks bool
 }
 
 type metaEntry struct {
@@ -143,7 +146,14 @@ func (f *fakeIAS3) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	f.checks++
+	fail := f.failChecks
 	f.mu.Unlock()
+	if fail {
+		// 501 Not Implemented: the httpx ladder does not retry it, so
+		// the preflight outage path is deterministic and fast.
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, `{"over_limit":0}`)
 }
@@ -344,6 +354,12 @@ func (f *fakeIAS3) taskCalls(id string) int {
 	return f.taskCallsByID[id]
 }
 
+func (f *fakeIAS3) checkCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checks
+}
+
 // --- tests ------------------------------------------------------------------
 
 // TestSinglePassHashing: the streaming hash reads the file exactly once
@@ -419,6 +435,7 @@ func TestItemFileOrderSequential(t *testing.T) {
 	assert.Equal(t, 1, f.maxInflight("testid-sequen1"), "PUTs into one item must never overlap")
 	assert.Equal(t, []string{"file1.bin", "file2.bin", "file3.bin"}, f.sequence(),
 		"files of one item must upload in the given order")
+	assert.Equal(t, 3, f.checkCount(), "each admitted PUT must pass the check_limit preflight")
 	for _, tgt := range tgts {
 		assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgt).State)
 	}
@@ -644,6 +661,113 @@ func TestDeriveWatchPerItemAfterLast(t *testing.T) {
 	assert.True(t, found, "expected an item-level failed event for the derive")
 	// One watch per item: baseline (call 1) + the failing poll (call 2).
 	assert.Equal(t, 2, f.taskCalls("testid-derivewt1"))
+}
+
+// TestCheckLimitOutageFailsFileWithoutPUT: a stably erroring check_limit
+// endpoint fails the file after the poll cap — no PUT is ever admitted.
+func TestCheckLimitOutageFailsFileWithoutPUT(t *testing.T) {
+	old := ias3.CheckLimitPoll
+	ias3.CheckLimitPoll = time.Millisecond // shrink the poll cadence
+	t.Cleanup(func() { ias3.CheckLimitPoll = old })
+
+	paths := writeUploadFiles(t, "preflight-me")
+	f := newFakeIAS3(t)
+	f.failChecks = true
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-prefligh1")
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	require.NoError(t, err) // per-file failures are journaled, never fatal
+	assert.Equal(t, 0, f.puts("file1.bin"), "a stalled-queue preflight must never admit a PUT")
+	assert.GreaterOrEqual(t, f.checkCount(), 1, "the preflight must actually poll the endpoint")
+	assert.Equal(t, 1, sum.Failed)
+	assert.Equal(t, 0, sum.Done)
+	rec := mustUploadRecord(t, st, tgts[0])
+	assert.Equal(t, journal.StateFailed, rec.State)
+	found := false
+	for _, ev := range got {
+		if ev.State == journal.StateFailed && strings.Contains(ev.ErrMsg, "лимит очереди") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected the Russian stalled-queue failure message")
+}
+
+// TestDeriveWatchNotArmedWhenLastFileFails: the derive-queueing PUT
+// never happened, so the item must not watch derive — one Tasks API
+// call (the baseline before the first PUT's sibling) and no item-level
+// failure event.
+func TestDeriveWatchNotArmedWhenLastFileFails(t *testing.T) {
+	paths := writeUploadFiles(t, "d1", "d2-last")
+	f := newFakeIAS3(t)
+	f.putFn = func(identifier, key string, nth int) int {
+		if key == "file2.bin" && nth == 1 {
+			return http.StatusBadRequest
+		}
+		return http.StatusOK
+	}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-derivenot1")
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, sum.Done)
+	assert.Equal(t, 1, sum.Failed)
+	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
+	assert.Equal(t, journal.StateFailed, mustUploadRecord(t, st, tgts[1]).State)
+	assert.Equal(t, 1, f.taskCalls("testid-derivenot1"),
+		"baseline only: the last PUT failed, so no derive was queued and no watch may run")
+	for _, ev := range got {
+		if ev.Kind == EventState && ev.Target == "testid-derivenot1" && ev.State == journal.StateFailed {
+			t.Fatalf("item-level failure event must not fire without a queued derive: %+v", ev)
+		}
+	}
+}
+
+// TestDeriveWatchNotArmedWhenLastFileSkipped: a skip-matched last file
+// never PUTs, so no derive is queued and the item must not watch.
+func TestDeriveWatchNotArmedWhenLastFileSkipped(t *testing.T) {
+	paths := writeUploadFiles(t, "d1", "d2-skipme")
+	sum5 := md5.Sum([]byte("d2-skipme"))
+	f := newFakeIAS3(t)
+	f.metaFiles["testid-derivenot2"] = []metaEntry{{name: "file2.bin", md5: hex.EncodeToString(sum5[:])}}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-derivenot2")
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, true)
+	require.NoError(t, err)
+	assert.Equal(t, 1, sum.Done)
+	assert.Equal(t, 1, sum.Skipped)
+	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
+	assert.Equal(t, journal.StateSkipped, mustUploadRecord(t, st, tgts[1]).State)
+	assert.Equal(t, 1, f.taskCalls("testid-derivenot2"),
+		"baseline only: the last file skipped, so no derive was queued and no watch may run")
+	for _, ev := range got {
+		if ev.Kind == EventState && ev.Target == "testid-derivenot2" && ev.State == journal.StateFailed {
+			t.Fatalf("item-level failure event must not fire without a queued derive: %+v", ev)
+		}
+	}
+}
+
+// TestDeriveWatchSurvivesVerifyFailure: a verify failure after a
+// successful last PUT must not cancel the watch — the derive WAS queued
+// server-side by that PUT.
+func TestDeriveWatchSurvivesVerifyFailure(t *testing.T) {
+	paths := writeUploadFiles(t, "verify-me")
+	sum5 := md5.Sum([]byte("something-else"))
+	f := newFakeIAS3(t)
+	f.metaFiles["testid-derivewt2"] = []metaEntry{{name: "file1.bin", md5: hex.EncodeToString(sum5[:])}}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-derivewt2")
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), true, false)
+	require.NoError(t, err)
+	assert.Equal(t, 0, sum.Done)
+	assert.Equal(t, 1, sum.Failed)
+	assert.Equal(t, journal.StateFailed, mustUploadRecord(t, st, tgts[0]).State)
+	// Baseline capture + the (successful) watch prove the watch ran
+	// even though the file failed at verify.
+	assert.Equal(t, 2, f.taskCalls("testid-derivewt2"))
 }
 
 // TestBadCredentialsPausesQueue: a credentials refusal journals the file

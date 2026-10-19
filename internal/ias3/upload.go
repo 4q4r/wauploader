@@ -34,8 +34,11 @@ var (
 	// slowDownWait is the reference-client default pause between 503
 	// SlowDown re-PUTs (ia upload -s/--sleep default: 30s).
 	slowDownWait = 30 * time.Second
-	// checkLimitPoll is the cadence of the AwaitNotOverLimit poll loop.
-	checkLimitPoll = 15 * time.Second
+	// CheckLimitPoll is the cadence of the AwaitNotOverLimit poll loop
+	// (the preflight and the SlowDown re-PUT path). Exported so the
+	// upload runner's tests can shrink it — the ias3 tests shrink it
+	// the same way (tests run sequentially).
+	CheckLimitPoll = 15 * time.Second
 	// retryAfterUnit converts a Retry-After delay-seconds value into a
 	// wait; tests shrink it together with slowDownWait (tests run
 	// sequentially).
@@ -192,7 +195,7 @@ const maxCheckLimitErrors = 8
 
 // AwaitNotOverLimit polls CheckLimit until the overload flag clears or
 // ctx ends. The loop is the fail-safe consumer of CheckLimit: an errored
-// check counts as "still overloaded" and keeps polling at checkLimitPoll
+// check counts as "still overloaded" and keeps polling at CheckLimitPoll
 // cadence, so a flapping endpoint never produces a false green light.
 // maxCheckLimitErrors consecutive errored checks (without a single
 // success in between) end the loop with the last error: the endpoint is
@@ -215,7 +218,7 @@ func AwaitNotOverLimit(ctx context.Context, c *Client, identifier string) error 
 		if cerr := ctx.Err(); cerr != nil {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", cerr)
 		}
-		if !sleepCtx(ctx, checkLimitPoll) {
+		if !sleepCtx(ctx, CheckLimitPoll) {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", ctx.Err())
 		}
 	}

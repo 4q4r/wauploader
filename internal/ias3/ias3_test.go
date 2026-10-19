@@ -41,9 +41,9 @@ func writeTempFile(t *testing.T, content string) string {
 // shrinkPacing replaces the 503-loop sleeps with 1ms so tests finish fast.
 func shrinkPacing(t *testing.T) {
 	t.Helper()
-	oldSleep, oldPoll := slowDownWait, checkLimitPoll
-	slowDownWait, checkLimitPoll = time.Millisecond, time.Millisecond
-	t.Cleanup(func() { slowDownWait, checkLimitPoll = oldSleep, oldPoll })
+	oldSleep, oldPoll := slowDownWait, CheckLimitPoll
+	slowDownWait, CheckLimitPoll = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { slowDownWait, CheckLimitPoll = oldSleep, oldPoll })
 }
 
 // --- ValidateIdentifier -------------------------------------------------

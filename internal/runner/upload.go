@@ -1,7 +1,7 @@
 // upload.go implements the upload pipeline (docs/plan.md Task 11):
-// targets → hash once → skip-if-exists → check_limit preflight → PUT →
-// optional verify → per-item derive watch, journaled at every
-// transition.
+// targets → hash once → skip-if-exists → check_limit preflight → derive
+// baseline → PUT → optional verify → per-item derive watch, journaled at
+// every transition.
 //
 // Load-bearing decisions (documented for Task 12 wiring):
 //
@@ -47,14 +47,17 @@
 //     contract.
 //   - Derive watch (--wait-derive semantics) is PER ITEM and tied to
 //     o.QueueDerive: with derive not queued there is nothing to wait
-//     for, and the Run signature carries no separate flag. The baseline
-//     task id is captured lazily, right before the item's first actual
-//     PUT (items whose files all skip never touch the Tasks API). After
-//     the last file, WaitDerive runs with Limits.PollStart as the poll
-//     cadence and Limits.JobWait as the budget; a derive failure is an
-//     item-level failed event while the files stay done, and the
-//     summary counts it as one extra Failed (mixed granularity by
-//     design).
+//     for, and the Run signature carries no separate flag. The watch
+//     fires only when a PUT actually carrying QueueDerive=true
+//     succeeded ("armed"): if the last file failed or skip-matched, no
+//     derive was queued and waiting would burn the JobWait budget into
+//     a false item failure. The baseline task id is captured lazily,
+//     right before the item's first actual PUT (items whose files all
+//     skip never touch the Tasks API). After the last file, WaitDerive
+//     runs with Limits.PollStart as the poll cadence and Limits.JobWait
+//     as the budget; a derive failure is an item-level failed event
+//     while the files stay done, and the summary counts it as one extra
+//     Failed (mixed granularity by design).
 //   - Verify (--verify): after a successful PUT the Item Metadata API
 //     must show the file with the local MD5. A missing file or an
 //     entry without a digest right after the PUT is ingest lag — retried
@@ -355,7 +358,7 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 	var (
 		baseline     int64
 		haveBaseline bool
-		putDone      bool
+		deriveArmed  bool // a PUT carrying QueueDerive=true succeeded
 	)
 	for i := range it.files {
 		f := &it.files[i]
@@ -398,6 +401,18 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 				r.con.Dimf("Пропущено (уже в элементе, md5 совпал): %s → %s/%s", f.t.Path, f.t.Identifier, f.t.Key)
 				continue
 			}
+		}
+
+		// Stage 3: check_limit preflight — poll while the item's upload
+		// queue is over limit; the fail-safe cap ends a stably broken
+		// endpoint. Runs per file, right before admission, so the
+		// baseline below stays the closest pre-PUT snapshot.
+		if err := ias3.AwaitNotOverLimit(ctx, r.cl, f.t.Identifier); err != nil {
+			if ctx.Err() != nil {
+				return // cancelled while waiting; the record stays queued
+			}
+			r.failFile(events, c, f, "check-limit", fmt.Sprintf("лимит очереди IA-S3 стабильно занят: %v", err))
+			continue
 		}
 
 		// Stages 3+6 prep: capture the derive baseline right before the
@@ -454,7 +469,12 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			r.failFile(events, c, f, "upload", err.Error())
 			continue
 		}
-		putDone = true
+		// The derive-queueing PUT went out successfully: arm the watch
+		// even if verify below fails — the derive is queued server-side
+		// either way. A failed or skip-matched last file never arms it.
+		if o.QueueDerive && f.lastInPlan {
+			deriveArmed = true
+		}
 		r.emit(events, Event{Kind: EventProgress, Target: f.target, Sent: size, Total: size})
 
 		// Stage 5: verify the remote copy by MD5.
@@ -477,9 +497,10 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 	}
 
 	// Stage 6: one derive watch per item, after the last file — only
-	// when this run actually PUT something (skips queue no derive) and
-	// derive was requested.
-	if !putDone || !o.QueueDerive || !haveBaseline {
+	// when a PUT actually carrying QueueDerive=true succeeded (armed).
+	// If the last file failed or skip-matched, no derive was queued and
+	// waiting would burn the JobWait budget into a false item failure.
+	if !deriveArmed || !haveBaseline {
 		return
 	}
 	r.emit(events, Event{Kind: EventWait, Target: it.identifier, ErrMsg: "ожидание деривации элемента"})
