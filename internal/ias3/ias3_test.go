@@ -523,3 +523,95 @@ func TestUploadBracketedMetaNameRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "не поддерживаются S3-заголовками")
 	assert.Equal(t, 0, requests, "must fail fast before any HTTP request")
 }
+
+// --- addendum: 429 Too Many Requests retries within the SlowDown budget ---
+
+func TestUpload429RetryThenSuccess(t *testing.T) {
+	shrinkPacing(t)
+	puts := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			if r.URL.Query().Get("check_limit") == "1" {
+				_, _ = w.Write([]byte(`{"over_limit":0}`))
+			}
+			return
+		}
+		puts++
+		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
+		if puts <= 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`too many requests, slow down`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	cl, _ := newTestClient(t, h)
+	path := writeTempFile(t, "data")
+
+	err := cl.Upload(context.Background(), UploadRequest{
+		Identifier: "testid1", Key: "file.bin", Path: path, Size: 4,
+	}, HeaderOpts{Mediatype: "data"}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, 3, puts, "429 must be retried within the existing budget: 2x429 then success = 3 PUTs")
+}
+
+func TestUpload429HonorsRetryAfter(t *testing.T) {
+	oldSleep, oldUnit := slowDownWait, retryAfterUnit
+	slowDownWait, retryAfterUnit = 100*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { slowDownWait, retryAfterUnit = oldSleep, oldUnit })
+
+	puts := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			_, _ = w.Write([]byte(`{"over_limit":0}`))
+			return
+		}
+		puts++
+		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
+		if puts == 1 {
+			w.Header().Set("Retry-After", "3")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`too many requests`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	cl, _ := newTestClient(t, h)
+	path := writeTempFile(t, "data")
+
+	start := time.Now()
+	err := cl.Upload(context.Background(), UploadRequest{
+		Identifier: "testid1", Key: "file.bin", Path: path, Size: 4,
+	}, HeaderOpts{Mediatype: "data"}, nil)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, puts)
+	assert.GreaterOrEqual(t, elapsed, 3*time.Millisecond, "the Retry-After delay (3 units) must be honored")
+	assert.Less(t, elapsed, 60*time.Millisecond, "Retry-After must override the 100ms default sleep (ignored Retry-After would sleep 100ms)")
+}
+
+func TestUpload429SpamBodyTerminal(t *testing.T) {
+	shrinkPacing(t)
+	puts := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts++
+			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>Your file appears to be spam and has been blocked.</Message></Error>`))
+		}
+	})
+	cl, _ := newTestClient(t, h)
+	path := writeTempFile(t, "data")
+
+	err := cl.Upload(context.Background(), UploadRequest{
+		Identifier: "testid1", Key: "file.bin", Path: path, Size: 4,
+	}, HeaderOpts{Mediatype: "data"}, nil)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrSpamSlowDown), "429+spam must be terminal like 503+spam, got: %v", err)
+	assert.Equal(t, 1, puts, "spam body takes precedence over the retry decision — exactly 1 PUT")
+}

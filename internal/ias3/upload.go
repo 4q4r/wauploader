@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ var (
 	slowDownWait = 30 * time.Second
 	// checkLimitPoll is the cadence of the awaitNotOverLimit poll loop.
 	checkLimitPoll = 15 * time.Second
+	// retryAfterUnit converts a Retry-After delay-seconds value into a
+	// wait; tests shrink it together with slowDownWait (tests run
+	// sequentially).
+	retryAfterUnit = time.Second
 )
 
 // Sentinel errors — branch with errors.Is. The spam case is deliberately
@@ -313,9 +318,12 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 //
 //   - 503 with "appears to be spam" in the body → terminal
 //     ErrSpamSlowDown, NEVER retried;
-//   - plain 503 SlowDown and any 5xx whose body is not valid error XML →
-//     sleep slowDownWait (30s default), re-check via awaitNotOverLimit,
-//     re-PUT the whole file; at most maxUploadAttempts PUTs total;
+//   - 429 Too Many Requests (owner ruling, rclone precedent) and plain
+//     503 SlowDown, plus any 5xx whose body is not valid error XML →
+//     sleep, re-check via awaitNotOverLimit, re-PUT the whole file; at
+//     most maxUploadAttempts PUTs total. A 429's Retry-After header is
+//     honored (delay-seconds), capped at the 30s default sleep; the spam
+//     sniff runs on 429 bodies too, before the retry decision;
 //   - 403 with XML code InvalidAccessKeyId or body "bad request" →
 //     terminal ErrBadCredentials;
 //   - every other answered status → typed *S3Error, terminal;
@@ -422,8 +430,11 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 			return nil
 		}
 
-		// Terminal spam block — check BEFORE any retry decision.
-		if status == http.StatusServiceUnavailable && bytes.Contains(raw, []byte("appears to be spam")) {
+		// Terminal spam block — check BEFORE any retry decision. IA
+		// delivers the spam block as a 503 SlowDown (r2 §4.2); it is
+		// sniffed on 429 responses too now that those are retryable.
+		if (status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests) &&
+			bytes.Contains(raw, []byte("appears to be spam")) {
 			return ErrSpamSlowDown
 		}
 
@@ -434,16 +445,25 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 			return ErrBadCredentials
 		}
 
-		// Retryable: plain 503 SlowDown, and any 5xx whose body is not
+		// Retryable: 429 Too Many Requests (owner ruling, rclone
+		// precedent), plain 503 SlowDown, and any 5xx whose body is not
 		// valid error XML (r2 §4.1: probably temporary).
-		retryable := status == http.StatusServiceUnavailable || (status >= 500 && !xmlOK)
+		retryable := status == http.StatusServiceUnavailable ||
+			status == http.StatusTooManyRequests ||
+			(status >= 500 && !xmlOK)
 		if retryable {
 			if attempt == maxUploadAttempts {
 				// Budget spent: surface the last failure as a typed error.
 				return budgetExhaustedError(status, parsed, xmlOK, raw)
 			}
-			if !sleepCtx(ctx, slowDownWait) {
-				return fmt.Errorf("загрузка %s прервана во время ожидания после 503: %w", req.Key, ctx.Err())
+			// 429 honors Retry-After (capped at the SlowDown default);
+			// 503/5xx use the default reference-client sleep.
+			wait := slowDownWait
+			if status == http.StatusTooManyRequests {
+				wait = retryAfterPause(resp.Header)
+			}
+			if !sleepCtx(ctx, wait) {
+				return fmt.Errorf("загрузка %s прервана во время ожидания после HTTP %d: %w", req.Key, status, ctx.Err())
 			}
 			if err := awaitNotOverLimit(ctx, c, req.Identifier); err != nil {
 				return fmt.Errorf("загрузка %s: %w", req.Key, err)
@@ -469,6 +489,23 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 	return errors.New("ias3: цикл загрузки завершился неожиданно")
 }
 
+// retryAfterPause converts a Retry-After delay-seconds header into a
+// bounded wait: seconds × retryAfterUnit, capped at slowDownWait (the 30s
+// default sleep). A missing, unparseable, non-positive, or overflowing
+// value falls back to the default sleep — the cap also absorbs the
+// Duration-overflow of an absurdly large value.
+func retryAfterPause(h http.Header) time.Duration {
+	secs, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After")))
+	if err != nil || secs <= 0 {
+		return slowDownWait
+	}
+	wait := time.Duration(secs) * retryAfterUnit
+	if wait <= 0 || wait > slowDownWait {
+		return slowDownWait
+	}
+	return wait
+}
+
 // budgetExhaustedError builds the typed failure for a retryable status
 // that survived the whole loop budget.
 func budgetExhaustedError(status int, parsed s3ErrorXML, xmlOK bool, raw []byte) error {
@@ -483,7 +520,6 @@ func budgetExhaustedError(status int, parsed s3ErrorXML, xmlOK bool, raw []byte)
 	}
 	return &S3Error{
 		StatusCode:   status,
-		Code:         "SlowDown",
 		Message:      fmt.Sprintf("исчерпан бюджет попыток (%d), archive.org продолжает отвечать ошибкой", maxUploadAttempts),
 		bodyFragment: truncateFragment(string(raw)),
 	}
