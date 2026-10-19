@@ -73,6 +73,12 @@ type Event struct {
 	SnapshotURL string
 	ErrMsg      string
 	Attempt     int
+
+	// Upload progress (EventProgress events, upload.go): Sent bytes of
+	// Total sent in the current PUT attempt; always zero on save
+	// events. Additive fields for the shared event stream.
+	Sent  int64
+	Total int64
 }
 
 // Summary is the batch outcome reported by the completion func.

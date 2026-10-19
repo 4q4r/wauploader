@@ -179,6 +179,22 @@ func (c *Client) FileExistsMatchingMD5(ctx context.Context, identifier, key, md5
 	return false, nil
 }
 
+// HasActiveTasks is the reference-client skip guard (r2 §2.3
+// --checksum semantics): it reports whether the item currently has ANY
+// task in the catalog — any command counts, the derive AND the
+// archive.php ingest alike — because while the item is busy the Item
+// Metadata answer a skip decision relies on may be stale. History is
+// ignored: finished tasks cannot make metadata stale. Envelope and
+// transport failures come back as (false, err) — the caller decides
+// fail-safe (an undecidable skip is not a skip).
+func (c *Client) HasActiveTasks(ctx context.Context, identifier string) (bool, error) {
+	listing, err := c.fetchTaskListing(ctx, identifier)
+	if err != nil {
+		return false, err
+	}
+	return len(listing.Value.Catalog) > 0, nil
+}
+
 // --- Derive polling ---------------------------------------------------------
 
 // DeriveState is wauploader's view of a derive job's progress. The numeric
