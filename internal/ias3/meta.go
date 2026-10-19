@@ -19,6 +19,7 @@
 //     catalog task — including the non-derive archive.php ingest — means
 //     pending and never falls through to history. Among catalog derives
 //     the NEWEST by task_id defines the state (tasks serialize per item).
+
 package ias3
 
 import (
@@ -83,11 +84,14 @@ func (f *flexInt64) UnmarshalJSON(b []byte) error {
 		*f = 0
 		return nil
 	}
+
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
 		return fmt.Errorf("ожидалось число (или строка с числом), получено: %s", truncateFragment(string(b)))
 	}
+
 	*f = flexInt64(n)
+
 	return nil
 }
 
@@ -113,33 +117,41 @@ func (c *Client) ItemFiles(ctx context.Context, identifier string) ([]ItemFile, 
 	if err := ValidateIdentifier(identifier); err != nil {
 		return nil, err
 	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.webBase+"/metadata/"+url.PathEscape(identifier), nil)
 	if err != nil {
 		return nil, fmt.Errorf("чтение метаданных элемента %s: построить запрос: %w", identifier, sanitizeReqErr(err))
 	}
+
 	c.setAuth(req)
+
 	resp, err := c.hc.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryIdempotent})
 	if err != nil {
 		return nil, fmt.Errorf("чтение метаданных элемента %s не выполнено: %w", identifier, sanitizeReqErr(err))
 	}
+
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
 		_ = resp.Body.Close()
 	}()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("чтение метаданных элемента %s: неожиданный HTTP %d", identifier, resp.StatusCode)
 	}
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxMetaBodyRead))
 	if err != nil {
 		return nil, fmt.Errorf("чтение метаданных элемента %s: чтение ответа: %w", identifier, err)
 	}
+
 	var payload struct {
 		Files []itemFileJSON `json:"files"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, fmt.Errorf("чтение метаданных элемента %s: ответ не разобран: %w", identifier, err)
 	}
+
 	files := make([]ItemFile, 0, len(payload.Files))
 	for _, f := range payload.Files {
 		files = append(files, ItemFile{
@@ -150,6 +162,7 @@ func (c *Client) ItemFiles(ctx context.Context, identifier string) ([]ItemFile, 
 			Size:  int64(f.Size),
 		})
 	}
+
 	return files, nil
 }
 
@@ -163,19 +176,23 @@ func (c *Client) FileExistsMatchingMD5(ctx context.Context, identifier, key, md5
 	if key == "" {
 		return false, errors.New("проверка «пропустить, если уже загружен» невозможна: не указано имя файла внутри элемента")
 	}
+
 	if md5Hex == "" {
 		// No local digest — nothing to prove identity with; re-upload.
 		return false, nil
 	}
+
 	files, err := c.ItemFiles(ctx, identifier)
 	if err != nil {
 		return false, fmt.Errorf("проверка «пропустить, если уже загружен»: %w", err)
 	}
+
 	for _, f := range files {
 		if f.Name == key {
 			return f.MD5 != "" && f.MD5 == md5Hex, nil
 		}
 	}
+
 	return false, nil
 }
 
@@ -192,6 +209,7 @@ func (c *Client) HasActiveTasks(ctx context.Context, identifier string) (bool, e
 	if err != nil {
 		return false, err
 	}
+
 	return len(listing.Value.Catalog) > 0, nil
 }
 
@@ -268,6 +286,7 @@ func taskIDInt64(t tasksTask) int64 {
 	if n, err := t.TaskID.Int64(); err == nil {
 		return n
 	}
+
 	return 0
 }
 
@@ -307,15 +326,19 @@ func (c *Client) NewestDeriveTaskID(ctx context.Context, identifier string) (int
 	if err != nil {
 		return 0, err
 	}
+
 	maxID := int64(0)
+
 	for _, t := range append(listing.Value.Catalog, listing.Value.History...) {
 		if t.Cmd != deriveCmd {
 			continue
 		}
+
 		if id := taskIDInt64(t); id > maxID {
 			maxID = id
 		}
 	}
+
 	return maxID, nil
 }
 
@@ -328,43 +351,54 @@ func (c *Client) fetchTaskListing(ctx context.Context, identifier string) (tasks
 	if err := ValidateIdentifier(identifier); err != nil {
 		return payload, err
 	}
+
 	q := url.Values{}
 	q.Set("identifier", identifier)
 	q.Set("catalog", "1")
 	q.Set("history", "1")
 	q.Set("limit", strconv.Itoa(tasksPageLimit))
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.webBase+"/services/tasks.php?"+q.Encode(), nil)
 	if err != nil {
 		return payload, fmt.Errorf("опрос задач элемента %s: построить запрос: %w", identifier, sanitizeReqErr(err))
 	}
+
 	c.setAuth(req)
+
 	resp, err := c.hc.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryIdempotent})
 	if err != nil {
 		return payload, fmt.Errorf("опрос задач элемента %s не выполнен: %w", identifier, sanitizeReqErr(err))
 	}
+
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
 		_ = resp.Body.Close()
 	}()
+
 	if resp.StatusCode != http.StatusOK {
 		return payload, fmt.Errorf("опрос задач элемента %s: неожиданный HTTP %d", identifier, resp.StatusCode)
 	}
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 	if err != nil {
 		return payload, fmt.Errorf("опрос задач элемента %s: чтение ответа: %w", identifier, err)
 	}
+
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return payload, fmt.Errorf("опрос задач элемента %s: ответ не разобран: %w", identifier, err)
 	}
+
 	if !payload.Success {
 		reason := strings.TrimSpace(payload.Error)
 		if reason == "" {
 			reason = "причина не указана"
 		}
+
 		return payload, fmt.Errorf("опрос задач элемента %s не выполнен, archive.org вернул ошибку: %s",
 			identifier, truncateFragment(reason))
 	}
+
 	return payload, nil
 }
 
@@ -388,21 +422,27 @@ func (c *Client) deriveStatusDetailed(ctx context.Context, identifier string, ba
 	// work is in flight.
 	if len(payload.Value.Catalog) > 0 {
 		var newest tasksTask
+
 		var haveNewest bool
+
 		var newestID int64
+
 		for _, t := range payload.Value.Catalog {
 			if t.Cmd != deriveCmd {
 				continue
 			}
+
 			if id := taskIDInt64(t); !haveNewest || id > newestID {
 				newest, haveNewest, newestID = t, true, id
 			}
 		}
+
 		if !haveNewest {
 			// Busy with other work (e.g. the PUT's own ingest); the
 			// derive has not queued yet — keep the caller waiting.
 			return DeriveNone, "", nil
 		}
+
 		switch newest.WaitAdmin {
 		case 0:
 			return DeriveQueued, newest.TaskID.String(), nil
@@ -423,19 +463,25 @@ func (c *Client) deriveStatusDetailed(ctx context.Context, identifier string, ba
 	// Catalog empty: done means a derive NEWER than the pre-PUT baseline
 	// finished into history — an older one belongs to a prior batch.
 	var done tasksTask
+
 	var haveDone bool
+
 	var doneID int64
+
 	for _, t := range payload.Value.History {
 		if t.Cmd != deriveCmd {
 			continue
 		}
+
 		if id := taskIDInt64(t); id > baselineTaskID && (!haveDone || id > doneID) {
 			done, haveDone, doneID = t, true, id
 		}
 	}
+
 	if haveDone {
 		return DeriveDone, done.TaskID.String(), nil
 	}
+
 	return DeriveNone, "", nil
 }
 
@@ -458,17 +504,21 @@ func WaitDerive(ctx context.Context, c *Client, identifier string, baselineTaskI
 	if poll <= 0 {
 		return errors.New("ожидание деривации: интервал опроса должен быть положительным")
 	}
+
 	if timeout <= 0 {
 		return errors.New("ожидание деривации: время ожидания должно быть положительным")
 	}
+
 	wctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
 	budgetErr := func() error {
 		return fmt.Errorf("деривация элемента «%s» не завершилась за отведённое время ожидания", identifier)
 	}
 	interruptedErr := func() error {
 		return fmt.Errorf("ожидание деривации элемента «%s» прервано: %w", identifier, ctx.Err())
 	}
+
 	for {
 		st, taskID, err := c.deriveStatusDetailed(wctx, identifier, baselineTaskID)
 		if err != nil {
@@ -481,6 +531,7 @@ func WaitDerive(ctx context.Context, c *Client, identifier string, baselineTaskI
 				return err
 			}
 		}
+
 		switch st {
 		case DeriveDone:
 			return nil
@@ -489,12 +540,15 @@ func WaitDerive(ctx context.Context, c *Client, identifier string, baselineTaskI
 				return fmt.Errorf("деривация элемента «%s» завершилась ошибкой (задача %s): подробности на странице истории элемента",
 					identifier, taskID)
 			}
+
 			return fmt.Errorf("деривация элемента «%s» завершилась ошибкой: подробности на странице истории элемента", identifier)
 		}
+
 		if !sleepCtx(wctx, poll) {
 			if ctx.Err() != nil {
 				return interruptedErr()
 			}
+
 			return budgetErr()
 		}
 	}

@@ -32,8 +32,10 @@ func main() {
 			if ee.Err != nil {
 				printCLIError(ee.Err)
 			}
+
 			os.Exit(ee.Code)
 		}
+
 		printCLIError(err)
 		os.Exit(1)
 	}

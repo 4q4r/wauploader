@@ -3,6 +3,7 @@
 // and drives the Task 10 save runner. The flag surface mirrors the plan
 // verbatim; --dry-run resolves targets and journal logic without touching
 // the network or the journal file.
+
 package commands
 
 import (
@@ -68,13 +69,16 @@ func saveOptionsFrom(cfg *config.Config, f *saveFlags) spn2.Options {
 	if f.ifNotArchivedWithin != "" {
 		o.IfNotArchivedWithin = f.ifNotArchivedWithin
 	}
+
 	if f.jsBehaviorTimeout >= 0 {
 		o.JSBehaviorTimeout = f.jsBehaviorTimeout
 	}
+
 	o.CaptureCookie = f.captureCookie
 	o.UseUserAgent = f.useUserAgent
 	o.TargetUsername = f.targetUsername
 	o.TargetPassword = f.targetPassword
+
 	return o
 }
 
@@ -87,9 +91,11 @@ func validateSaveOptions(opts spn2.Options) error {
 			return exitUsage("недопустимое значение --if-not-archived-within: %v", err)
 		}
 	}
+
 	if opts.JSBehaviorTimeout < 0 || opts.JSBehaviorTimeout > 30 {
 		return exitUsage("--js-behavior-timeout должен быть от 0 до 30 секунд, сейчас %d", opts.JSBehaviorTimeout)
 	}
+
 	return nil
 }
 
@@ -129,6 +135,7 @@ func NewSaveCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *b
 	fs.StringVar(&f.useUserAgent, "use-user-agent", "", "use_user_agent: User-Agent для запроса к сайту-цели")
 	fs.StringVar(&f.targetUsername, "target-username", "", "target_username: имя пользователя для сайта-цели")
 	fs.StringVar(&f.targetPassword, "target-password", "", "target_password: пароль сайта-цели (секрет, нигде не выводится)")
+
 	return cmd
 }
 
@@ -144,17 +151,21 @@ func runSave(cmd *cobra.Command, args []string, f *saveFlags,
 	if err != nil {
 		return exitUsage("%v", err)
 	}
+
 	cfg, err := loadConfig(expandHomePath(cfgPath), errOut)
 	if err != nil {
 		return err
 	}
+
 	if err := cfg.Validate(config.ModeSave); err != nil {
 		return exitUsage("%v", err)
 	}
+
 	opts := saveOptionsFrom(cfg, f)
 	if err := validateSaveOptions(opts); err != nil {
 		return err
 	}
+
 	creds, err := auth.Resolve(cfg)
 	if err != nil {
 		return exitAuth(err)
@@ -168,6 +179,7 @@ func runSave(cmd *cobra.Command, args []string, f *saveFlags,
 	if err != nil {
 		return err
 	}
+
 	st, err := journal.Open(jp)
 	if err != nil {
 		return &ExitError{Code: ExitSomeFailed, Err: err}
@@ -186,24 +198,30 @@ func runSave(cmd *cobra.Command, args []string, f *saveFlags,
 	if cfg.Limits.SavePerMinute >= 1 {
 		lim.PerMinute = rate.Every(time.Minute / time.Duration(cfg.Limits.SavePerMinute))
 	}
+
 	jobWait, err := config.ParseIATimedelta(cfg.Limits.JobWait)
 	if err != nil {
 		return exitUsage("недопустимое значение job_wait: %v", err)
 	}
+
 	lim.JobWait = jobWait
 
 	sp := spn2.NewClient(newHTTPClient(), creds)
 	r := runner.NewSaveRunner(sp, st, lim, runnerConsole(con, jsonOut))
 
 	events, done := r.Run(cmd.Context(), targets, opts, f.force)
+
 	var p eventPump
 	p.pumpStart(events, con, jsonOut)
+
 	summary, rerr := done()
+
 	p.wait()
 
 	if !jsonOut {
 		saveSummaryLine(con, summary)
 	}
+
 	return finishRun(rerr, summary, p.authPaused.Load())
 }
 
@@ -216,6 +234,7 @@ func runSaveDry(con *console.Console, journalFlag string, targets []string, forc
 	if err != nil {
 		return err
 	}
+
 	doneSet, cleanup, err := saveDoneTargets(jp, targets)
 	if err != nil {
 		return err
@@ -223,18 +242,25 @@ func runSaveDry(con *console.Console, journalFlag string, targets []string, forc
 	defer cleanup()
 
 	skipped := 0
+
 	for _, t := range targets {
 		if doneSet[t] && !force {
 			con.Dimf("Пропущено (уже сохранено; для повтора --force): %s", t)
+
 			skipped++
+
 			continue
 		}
+
 		con.Infof("Сохранить: %s", t)
 	}
+
 	con.Infof("Итог dry-run: будет выполнено %d · пропущено %d", len(targets)-skipped, skipped)
+
 	if skipped > 0 {
 		return &ExitError{Code: ExitSomeFailed, Err: nil}
 	}
+
 	return nil
 }
 
@@ -246,12 +272,15 @@ func saveDoneTargets(journalPath string, targets []string) (map[string]bool, fun
 		if errors.Is(err, fs.ErrNotExist) {
 			return map[string]bool{}, func() {}, nil
 		}
+
 		return nil, nil, exitUsage("не удалось проверить файл журнала %s: %v", journalPath, err)
 	}
+
 	st, err := journal.Open(journalPath)
 	if err != nil {
 		return nil, nil, &ExitError{Code: ExitSomeFailed, Err: err}
 	}
+
 	done := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		rec, ok, err := st.Get(journal.KindSave, t)
@@ -259,9 +288,11 @@ func saveDoneTargets(journalPath string, targets []string) (map[string]bool, fun
 			_ = st.Close()
 			return nil, nil, &ExitError{Code: ExitSomeFailed, Err: err}
 		}
+
 		if ok && rec.State == journal.StateDone {
 			done[t] = true
 		}
 	}
+
 	return done, func() { _ = st.Close() }, nil
 }

@@ -2,6 +2,7 @@
 // (files or --list, --item or --identifier-from template), the required
 // collection/mediatype fail-fast (owner decision: no defaults), the
 // metadata header surface, and the Task 11 upload runner wiring.
+
 package commands
 
 import (
@@ -45,13 +46,16 @@ type uploadFlags struct {
 // metadata map (repeated names accumulate values).
 func parseMetaFlags(meta []string) (ias3.Meta, error) {
 	m := ias3.Meta{}
+
 	for _, pair := range meta {
 		name, value, ok := strings.Cut(pair, "=")
 		if !ok || name == "" {
 			return nil, errors.New("неверный формат --meta " + pair + ": ожидается ИМЯ=ЗНАЧЕНИЕ")
 		}
+
 		m[name] = append(m[name], value)
 	}
+
 	return m, nil
 }
 
@@ -63,18 +67,23 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 	if f.item != "" && f.identifierFrom != "" {
 		return nil, errors.New("нельзя использовать одновременно --item и --identifier-from")
 	}
+
 	if f.item == "" && f.identifierFrom == "" {
 		return nil, errors.New("не указан идентификатор элемента: задайте --item ID или --identifier-from ШАБЛОН (например \"custom-{{.Base}}\")")
 	}
+
 	if f.key != "" && f.identifierFrom != "" {
 		return nil, errors.New("--key допустим только вместе с --item")
 	}
+
 	var tmpl *template.Template
+
 	if f.identifierFrom != "" {
 		parsed, err := template.New("identifier").Parse(f.identifierFrom)
 		if err != nil {
 			return nil, errors.New("неверный шаблон --identifier-from: " + err.Error())
 		}
+
 		tmpl = parsed
 	}
 
@@ -84,24 +93,32 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 		if err != nil {
 			return nil, errors.New("не удалось определить путь " + p + ": " + err.Error())
 		}
+
 		id := f.item
+
 		if tmpl != nil {
 			var b strings.Builder
+
 			data := struct{ Base string }{Base: filepath.Base(abs)}
 			if err := tmpl.Execute(&b, data); err != nil {
 				return nil, errors.New("не удалось вычислить идентификатор для " + p + ": " + err.Error())
 			}
+
 			id = b.String()
 		}
+
 		if err := ias3.ValidateIdentifier(id); err != nil {
 			return nil, errors.New("файл " + p + ": " + err.Error())
 		}
+
 		key := f.key
 		if key == "" {
 			key = filepath.Base(abs)
 		}
+
 		targets = append(targets, runner.UploadTarget{Path: abs, Identifier: id, Key: key})
 	}
+
 	return targets, nil
 }
 
@@ -119,17 +136,21 @@ func headerOptsFrom(cfg *config.Config, f *uploadFlags) (ias3.HeaderOpts, error)
 	if err != nil {
 		return ias3.HeaderOpts{}, err
 	}
+
 	queueDerive := cfg.Upload.QueueDerive
 	if f.noDerive {
 		queueDerive = false
 	}
+
 	if f.waitDerive {
 		queueDerive = true
 	}
+
 	keepOld := cfg.Upload.KeepOldVersion
 	if f.noKeepOldVersion {
 		keepOld = false
 	}
+
 	return ias3.HeaderOpts{
 		Collection:              cfg.Upload.Collection,
 		Mediatype:               cfg.Upload.Mediatype,
@@ -176,6 +197,7 @@ func NewUploadCommand(configPath, journalPath *string, jsonOut, noColor, dryRun 
 	fs.BoolVar(&f.checksumSkip, "checksum-skip", false, "не пропускать файлы, уже присутствующие в элементе с тем же MD5")
 	fs.StringVar(&f.identifierFrom, "identifier-from", "",
 		"шаблон идентификатора для каждого файла, например \"custom-{{.Base}}\" (взаимоисключим с --item)")
+
 	return cmd
 }
 
@@ -192,28 +214,35 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	if err != nil {
 		return exitUsage("%v", err)
 	}
+
 	targets, err := uploadTargetsFrom(rawPaths, f)
 	if err != nil {
 		return exitUsage("%v", err)
 	}
+
 	if f.noDerive && f.waitDerive {
 		return exitUsage("--wait-derive требует очереди деривации — уберите --no-derive")
 	}
+
 	cfg, err := loadConfig(expandHomePath(cfgPath), errOut)
 	if err != nil {
 		return err
 	}
+
 	cfg.MergeFlag(func(c *config.Config) {
 		if f.collection != "" {
 			c.Upload.Collection = f.collection
 		}
+
 		if f.mediatype != "" {
 			c.Upload.Mediatype = f.mediatype
 		}
 	})
+
 	if err := cfg.Validate(config.ModeUpload); err != nil {
 		return exitUsage("%v", err)
 	}
+
 	creds, err := auth.Resolve(cfg)
 	if err != nil {
 		return exitAuth(err)
@@ -225,6 +254,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	if creds.Access == "" || creds.Secret == "" {
 		return exitAuth(errors.New("загрузка в archive.org выполняется ключами S3: заполните s3_access и s3_secret в файле конфигурации (получить: https://archive.org/account/s3.php) или выполните wauploader init"))
 	}
+
 	opts, err := headerOptsFrom(cfg, f)
 	if err != nil {
 		return exitUsage("%v", err)
@@ -238,6 +268,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	if err != nil {
 		return err
 	}
+
 	st, err := journal.Open(jp)
 	if err != nil {
 		return &ExitError{Code: ExitSomeFailed, Err: err}
@@ -252,6 +283,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	if err != nil {
 		return exitUsage("недопустимое значение job_wait: %v", err)
 	}
+
 	lim := runner.Limits{
 		PerMinute:   rate.Inf,
 		Concurrency: cfg.Limits.UploadConcurrency,
@@ -263,14 +295,18 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	r := runner.NewUploadRunner(cl, st, lim, runnerConsole(con, jsonOut))
 
 	events, done := r.Run(cmd.Context(), targets, opts, f.verify, !f.checksumSkip)
+
 	var p eventPump
 	p.pumpStart(events, con, jsonOut)
+
 	summary, rerr := done()
+
 	p.wait()
 
 	if !jsonOut {
 		uploadSummaryLine(con, summary)
 	}
+
 	return finishRun(rerr, summary, p.authPaused.Load())
 }
 
@@ -281,6 +317,7 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 	if err != nil {
 		return err
 	}
+
 	doneSet, cleanup, err := uploadDoneTargets(jp, targets)
 	if err != nil {
 		return err
@@ -288,19 +325,26 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 	defer cleanup()
 
 	skipped := 0
+
 	for _, t := range targets {
 		composite := t.Path + "\x00" + t.Identifier + "/" + t.Key
 		if doneSet[composite] {
 			con.Dimf("Пропущено (уже в журнале): %s → %s/%s", t.Path, t.Identifier, t.Key)
+
 			skipped++
+
 			continue
 		}
+
 		con.Infof("Загрузить: %s → %s/%s", t.Path, t.Identifier, t.Key)
 	}
+
 	con.Infof("Итог dry-run: будет выполнено %d · пропущено %d", len(targets)-skipped, skipped)
+
 	if skipped > 0 {
 		return &ExitError{Code: ExitSomeFailed, Err: nil}
 	}
+
 	return nil
 }
 
@@ -310,23 +354,29 @@ func uploadDoneTargets(journalPath string, targets []runner.UploadTarget) (map[s
 		if os.IsNotExist(err) {
 			return map[string]bool{}, func() {}, nil
 		}
+
 		return nil, nil, exitUsage("не удалось проверить файл журнала %s: %v", journalPath, err)
 	}
+
 	st, err := journal.Open(journalPath)
 	if err != nil {
 		return nil, nil, &ExitError{Code: ExitSomeFailed, Err: err}
 	}
+
 	done := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		composite := t.Path + "\x00" + t.Identifier + "/" + t.Key
+
 		rec, ok, err := st.Get(journal.KindUpload, composite)
 		if err != nil {
 			_ = st.Close()
 			return nil, nil, &ExitError{Code: ExitSomeFailed, Err: err}
 		}
+
 		if ok && rec.State == journal.StateDone {
 			done[composite] = true
 		}
 	}
+
 	return done, func() { _ = st.Close() }, nil
 }

@@ -28,6 +28,7 @@
 //     records with a job id skip straight to polling. quota_parked
 //     records are NOT auto-resumed: requeueing them is a command-layer
 //     decision (T12), because the daily window may not have reset.
+
 package runner
 
 import (
@@ -106,9 +107,11 @@ type SaveRunner struct {
 // console discards human output.
 func NewSaveRunner(sp *spn2.Client, st *journal.Store, lim Limits, con *console.Console) *SaveRunner {
 	lim = lim.withDefaults()
+
 	if con == nil {
 		con = console.New(io.Discard, io.Discard, false, true)
 	}
+
 	return &SaveRunner{
 		sp:    sp,
 		st:    st,
@@ -140,11 +143,14 @@ type runResult struct {
 func (r *SaveRunner) Run(ctx context.Context, targets []string, opts spn2.Options, force bool) (<-chan Event, func() (Summary, error)) {
 	events := make(chan Event)
 	res := &runResult{done: make(chan struct{})}
+
 	go func() {
 		defer close(events)
+
 		res.summary, res.err = r.execute(ctx, targets, opts, force, events)
 		close(res.done)
 	}()
+
 	return events, func() (Summary, error) {
 		<-res.done
 		return res.summary, res.err
@@ -169,6 +175,7 @@ func (c *counters) incSkipped() { c.mu.Lock(); c.skipped++; c.mu.Unlock() }
 func (c *counters) summary() Summary {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return Summary{Done: c.done, Failed: c.failed, Parked: c.parked, Skipped: c.skipped}
 }
 
@@ -185,14 +192,18 @@ func (r *SaveRunner) execute(ctx context.Context, targets []string, opts spn2.Op
 	if err := r.lim.Validate(); err != nil {
 		return Summary{}, err
 	}
+
 	c := &counters{}
+
 	items, err := r.buildQueue(targets, force, events, c)
 	if err != nil {
 		return c.summary(), err
 	}
 
 	var paused atomic.Bool
+
 	var authOnce sync.Once
+
 	var authErr error
 
 	// The errgroup's limit is the global concurrency semaphore: at
@@ -201,20 +212,24 @@ func (r *SaveRunner) execute(ctx context.Context, targets []string, opts spn2.Op
 	// group error is always nil and cancellation travels through gctx.
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.lim.Concurrency)
+
 	for _, it := range items {
 		if paused.Load() || gctx.Err() != nil {
 			break // stop admitting; in-flight jobs finish
 		}
+
 		g.Go(func() error {
 			r.process(gctx, it, opts, events, c, &paused, &authOnce, &authErr)
 			return nil
 		})
 	}
+
 	_ = g.Wait()
 
 	if authErr != nil {
 		return c.summary(), authErr
 	}
+
 	return c.summary(), ctx.Err()
 }
 
@@ -233,6 +248,7 @@ func (r *SaveRunner) buildQueue(targets []string, force bool, events chan<- Even
 		r.con.Errorf("Не удалось прочитать журнал для возобновления: %v", err)
 		return nil, fmt.Errorf("чтение журнала не выполнено: %w", err)
 	}
+
 	for i := range resume {
 		rec := resume[i] // ByStates returns copies
 		items = append(items, workItem{rec: &rec})
@@ -243,18 +259,23 @@ func (r *SaveRunner) buildQueue(targets []string, force bool, events chan<- Even
 		if seen[t] {
 			continue
 		}
+
 		seen[t] = true
+
 		rec, ok, err := r.st.Get(journal.KindSave, t)
 		if err != nil {
 			r.con.Errorf("Не удалось прочитать запись журнала для %s: %v", t, err)
 			return nil, fmt.Errorf("чтение журнала не выполнено: %w", err)
 		}
+
 		if ok && rec.State == journal.StateDone && !force {
 			r.emit(events, Event{Kind: EventState, Target: t, State: journal.StateSkipped})
 			r.con.Dimf("Пропущено (уже сохранено): %s", t)
 			c.incSkipped()
+
 			continue
 		}
+
 		fresh := &journal.Record{Kind: journal.KindSave, Target: t, State: journal.StateQueued}
 		if ok {
 			// done+force, failed, quota_parked or skipped: an explicit
@@ -267,8 +288,10 @@ func (r *SaveRunner) buildQueue(targets []string, force bool, events chan<- Even
 			r.con.Errorf("Не удалось создать запись журнала для %s: %v", t, err)
 			return nil, fmt.Errorf("создание записи журнала не выполнено: %w", err)
 		}
+
 		items = append(items, workItem{rec: fresh})
 	}
+
 	return items, nil
 }
 
@@ -297,25 +320,30 @@ func (ps *pollState) trackSize(size int64) bool {
 		ps.last, ps.run = 0, 0
 		return false
 	}
+
 	if size == ps.last {
 		ps.run++
 	} else {
 		ps.last, ps.run = size, 1
 	}
+
 	return ps.run >= 3
 }
 
 // backoff returns the next poll wait: PollStart doubled each step up
 // to PollMax.
-func (ps *pollState) backoff(start, max time.Duration) time.Duration {
+func (ps *pollState) backoff(start, limit time.Duration) time.Duration {
 	d := start
-	for i := 0; i < ps.poll && d < max; i++ {
+	for i := 0; i < ps.poll && d < limit; i++ {
 		d *= 2
 	}
-	if d > max {
-		d = max
+
+	if d > limit {
+		d = limit
 	}
+
 	ps.poll++
+
 	return d
 }
 
@@ -328,6 +356,7 @@ func (r *SaveRunner) process(ctx context.Context, it workItem, opts spn2.Options
 	if paused.Load() {
 		return
 	}
+
 	release, err := r.hosts.acquire(ctx, hostOf(it.rec.Target))
 	if err != nil {
 		return // run cancelled while queued for a host slot
@@ -341,11 +370,13 @@ func (r *SaveRunner) process(ctx context.Context, it workItem, opts spn2.Options
 	r.emit(events, Event{Kind: EventState, Target: rec.Target, State: rec.State, JobID: rec.SPN2JobID, Attempt: rec.Attempts})
 
 	ps := &pollState{}
+
 	for {
 		if r.submitStage(jctx, rec, opts, events, c, paused, authOnce, authErr) {
 			r.finishOnStop(ctx, jctx, rec, events, c)
 			return
 		}
+
 		if r.pollStage(jctx, rec, ps, events, c, paused, authOnce, authErr) {
 			r.finishOnStop(ctx, jctx, rec, events, c)
 			return
@@ -372,12 +403,15 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 	if rec.SPN2JobID != "" {
 		return false // resumed with a job id: go straight to polling
 	}
+
 	if rec.Attempts >= maxSubmitAttempts {
 		rec.ErrKind = "attempts"
 		rec.ErrMsg = fmt.Sprintf("исчерпаны попытки отправки (%d)", maxSubmitAttempts)
 		r.finishFailed(events, c, rec)
+
 		return true
 	}
+
 	if paused.Load() {
 		// An auth pause landed while this worker waited in the resubmit
 		// loop: stay queued instead of submitting behind a paused queue.
@@ -387,14 +421,16 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 	if err := r.gate.Wait(ctx); err != nil {
 		return true // cancelled while pacing; the record stays queued
 	}
+
 	res, err := r.sp.Submit(ctx, rec.Target, opts)
-	if err != nil {
+	if err != nil { //nolint:nestif // submit outcome classes (auth/refusal/quota/transport) each need their own journal transition
 		if isAuthFailure(err) {
 			// Not charged: the refusal is about credentials, not the
 			// target; the record stays queued for the next run.
 			r.authPause(events, paused, authOnce, authErr, err)
 			return true
 		}
+
 		if isSessionLimit(err) {
 			// Session-busy refusal: wait for the quota to free and
 			// resubmit. The wait is expected behavior, not a failed
@@ -403,20 +439,25 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 			if !r.waitSession(ctx, rec, events, paused, authOnce, authErr) {
 				return true
 			}
+
 			return false
 		}
+
 		rec.Attempts++
 		rec.ErrKind = errKindName(err)
+
 		rec.ErrMsg = err.Error()
 		if serr := r.persist(rec, rec.State); serr != nil {
 			r.journalError(events, c, rec, serr)
 			return true
 		}
+
 		switch classifySPN2(err) {
 		case spn2.KindQuota:
 			rec.ErrKind = "quota"
 			rec.ErrMsg = parkMessage(err.Error())
 			r.park(events, c, rec)
+
 			return true
 		case spn2.KindTerminal:
 			r.finishFailed(events, c, rec)
@@ -427,6 +468,7 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 			if !sleepCtx(ctx, r.lim.PollStart) {
 				return true
 			}
+
 			return false
 		}
 	}
@@ -440,21 +482,25 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 
 	// Persist the job id immediately — status retention is 1h.
 	rec.SPN2JobID = res.JobID
+
 	rec.ErrKind, rec.ErrMsg = "", ""
 	if err := r.persist(rec, journal.StateSubmitted); err != nil {
 		r.journalError(events, c, rec, err)
 		return true
 	}
+
 	attempt := rec.Attempts + 1
 	r.emit(events, Event{Kind: EventState, Target: rec.Target, State: journal.StateSubmitted, JobID: res.JobID, Attempt: attempt})
 	r.con.Infof("Отправлено: %s (задание %s, попытка %d)", rec.Target, res.JobID, attempt)
 
 	if d, ok := spn2.ParseDelayMessage(res.Message); ok {
 		r.waitNote(events, rec, fmt.Sprintf("сервер указал задержку старта захвата: %s", d))
+
 		if !sleepCtx(ctx, d) {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -470,10 +516,12 @@ func (r *SaveRunner) pollStage(ctx context.Context, rec *journal.Record, ps *pol
 			r.authPause(events, paused, authOnce, authErr, err)
 			return true
 		}
+
 		if classifySPN2(err) == spn2.KindTerminal {
 			rec.ErrKind = errKindName(err)
 			rec.ErrMsg = err.Error()
 			r.finishFailed(events, c, rec)
+
 			return true
 		}
 		// Retryable (502 storms, transport hiccups): keep polling; the
@@ -481,6 +529,7 @@ func (r *SaveRunner) pollStage(ctx context.Context, rec *journal.Record, ps *pol
 		if !sleepCtx(ctx, ps.backoff(r.lim.PollStart, r.lim.PollMax)) {
 			return true
 		}
+
 		return false
 	}
 
@@ -490,16 +539,20 @@ func (r *SaveRunner) pollStage(ctx context.Context, rec *journal.Record, ps *pol
 		if orig == "" {
 			orig = rec.Target
 		}
+
 		rec.SnapshotTimestamp = st.Timestamp
 		rec.SnapshotURL = fmt.Sprintf(spn2.SnapshotURLFmt, st.Timestamp, orig)
+
 		rec.ErrKind, rec.ErrMsg = "", ""
 		if err := r.persist(rec, journal.StateDone); err != nil {
 			r.journalError(events, c, rec, err)
 			return true
 		}
+
 		c.incDone()
 		r.emit(events, Event{Kind: EventState, Target: rec.Target, State: journal.StateDone, JobID: rec.SPN2JobID, SnapshotURL: rec.SnapshotURL, Attempt: rec.Attempts})
 		r.con.Successf("Сохранено: %s → %s", rec.Target, rec.SnapshotURL)
+
 		return true
 
 	case "error":
@@ -509,20 +562,22 @@ func (r *SaveRunner) pollStage(ctx context.Context, rec *journal.Record, ps *pol
 		if d, ok := spn2.ParseDelayMessage(st.Message); ok {
 			// Sleep the server-stated delay instead of the blind ladder.
 			r.waitNote(events, rec, fmt.Sprintf("сервер указал задержку захвата: %s", d))
-			if !sleepCtx(ctx, d) {
-				return true
-			}
-			return false
+
+			return !sleepCtx(ctx, d)
 		}
+
 		if ps.trackSize(st.DownloadSize) {
 			rec.ErrKind = "stall"
 			rec.ErrMsg = fmt.Sprintf("загрузка остановилась: download_size не растёт (%d байт на трёх опросах подряд)", st.DownloadSize)
 			r.finishFailed(events, c, rec)
+
 			return true
 		}
+
 		if !sleepCtx(ctx, ps.backoff(r.lim.PollStart, r.lim.PollMax)) {
 			return true
 		}
+
 		return false
 	}
 }
@@ -552,21 +607,25 @@ func (r *SaveRunner) statusError(ctx context.Context, st spn2.Status, rec *journ
 		}
 		// The errored job is dead; requeue for a fresh submit.
 		rec.SPN2JobID = ""
+
 		rec.ErrKind, rec.ErrMsg = "", ""
 		if err := r.persist(rec, journal.StateQueued); err != nil {
 			r.journalError(events, c, rec, err)
 			return true
 		}
+
 		return false
 	case statusQuotaCodes[code]:
 		rec.ErrKind = "quota"
 		rec.ErrMsg = parkMessage(strings.Join(nonEmpty([]string{st.StatusExt, st.Message}), ": "))
 		r.park(events, c, rec)
+
 		return true
 	default:
 		rec.ErrKind = "terminal"
 		rec.ErrMsg = strings.Join(nonEmpty([]string{"задание завершилось ошибкой: " + st.StatusExt, st.Message}), ": ")
 		r.finishFailed(events, c, rec)
+
 		return true
 	}
 }
@@ -577,28 +636,36 @@ func (r *SaveRunner) statusError(ctx context.Context, st spn2.Status, rec *journ
 // or cancelled context).
 func (r *SaveRunner) waitSession(ctx context.Context, rec *journal.Record, events chan<- Event, paused *atomic.Bool, authOnce *sync.Once, authErr *error) bool {
 	noted := false
+
 	for {
 		if ctx.Err() != nil {
 			return false
 		}
+
 		avail, proc, err := r.sp.UserStatus(ctx)
 		if err != nil {
 			if isAuthFailure(err) {
 				r.authPause(events, paused, authOnce, authErr, err)
 				return false
 			}
+
 			if !sleepCtx(ctx, r.lim.PollStart) {
 				return false
 			}
+
 			continue
 		}
+
 		if proc < avail {
 			return true
 		}
+
 		if !noted {
 			r.waitNote(events, rec, fmt.Sprintf("лимит сеансов исчерпан (занято %d из %d) — ожидание освобождения", proc, avail))
+
 			noted = true
 		}
+
 		if !sleepCtx(ctx, r.lim.PollStart) {
 			return false
 		}
@@ -619,6 +686,7 @@ func (r *SaveRunner) persist(rec *journal.Record, st journal.State) error {
 	if err == nil {
 		rec.State = st
 	}
+
 	return err
 }
 
@@ -629,10 +697,12 @@ func (r *SaveRunner) finishDedup(events chan<- Event, c *counters, rec *journal.
 		rec.SnapshotTimestamp = ts
 		rec.SnapshotURL = fmt.Sprintf(spn2.SnapshotURLFmt, ts, rec.Target)
 	}
+
 	if err := r.persist(rec, journal.StateDone); err != nil {
 		r.journalError(events, c, rec, err)
 		return
 	}
+
 	c.incDone()
 	r.emit(events, Event{Kind: EventState, Target: rec.Target, State: journal.StateDone, SnapshotURL: rec.SnapshotURL, ErrMsg: message, Attempt: rec.Attempts})
 	r.con.Successf("Уже сохранено: %s → %s", rec.Target, rec.SnapshotURL)
@@ -644,6 +714,7 @@ func (r *SaveRunner) finishFailed(events chan<- Event, c *counters, rec *journal
 		r.journalError(events, c, rec, err)
 		return
 	}
+
 	c.incFailed()
 	r.emit(events, Event{Kind: EventState, Target: rec.Target, State: journal.StateFailed, JobID: rec.SPN2JobID, ErrMsg: rec.ErrMsg, Attempt: rec.Attempts})
 	r.con.Errorf("Не сохранено: %s: %s", rec.Target, rec.ErrMsg)
@@ -655,6 +726,7 @@ func (r *SaveRunner) park(events chan<- Event, c *counters, rec *journal.Record)
 		r.journalError(events, c, rec, err)
 		return
 	}
+
 	c.incParked()
 	r.emit(events, Event{Kind: EventState, Target: rec.Target, State: journal.StateQuotaParked, ErrMsg: rec.ErrMsg, Attempt: rec.Attempts})
 	r.con.Warnf("Квота исчерпана, отложено: %s", rec.Target)
@@ -664,6 +736,7 @@ func (r *SaveRunner) park(events chan<- Event, c *counters, rec *journal.Record)
 // be guaranteed, so the item counts as failed and the error is loud.
 func (r *SaveRunner) journalError(events chan<- Event, c *counters, rec *journal.Record, err error) {
 	c.incFailed()
+
 	msg := fmt.Sprintf("ошибка записи журнала: %v", err)
 	r.emit(events, Event{Kind: EventState, Target: rec.Target, State: rec.State, ErrMsg: msg, Attempt: rec.Attempts})
 	r.con.Errorf("%s: %v", rec.Target, err)
@@ -675,6 +748,7 @@ func (r *SaveRunner) journalError(events chan<- Event, c *counters, rec *journal
 func (r *SaveRunner) authPause(events chan<- Event, paused *atomic.Bool, authOnce *sync.Once, authErr *error, cause error) {
 	authOnce.Do(func() {
 		paused.Store(true)
+
 		*authErr = fmt.Errorf("ошибка авторизации archive.org (%v): выполнение очереди приостановлено — проверьте ключи или куки в конфигурации и запустите снова", cause)
 		r.emit(events, Event{Kind: EventAuth, ErrMsg: (*authErr).Error()})
 		r.con.Errorf("%v", *authErr)
@@ -711,6 +785,7 @@ func extractTimestamp(message string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
+
 	return m[1], true
 }
 
@@ -720,6 +795,7 @@ func asSPN2Error(err error) (*spn2.Error, bool) {
 	if errors.As(err, &se) {
 		return se, true
 	}
+
 	return nil, false
 }
 
@@ -730,9 +806,11 @@ func isAuthFailure(err error) bool {
 	if !ok {
 		return false
 	}
+
 	if se.HTTP == http.StatusUnauthorized {
 		return true
 	}
+
 	return strings.Contains(strings.ToLower(se.StatusExt), "unauthorized")
 }
 
@@ -749,6 +827,7 @@ func classifySPN2(err error) spn2.Kind {
 	if se, ok := asSPN2Error(err); ok {
 		return se.Kind
 	}
+
 	return spn2.KindRetryable
 }
 
@@ -772,5 +851,6 @@ func nonEmpty(in []string) []string {
 			out = append(out, s)
 		}
 	}
+
 	return out
 }

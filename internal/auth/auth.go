@@ -103,10 +103,12 @@ func Mask(s string) string {
 	if s == "" {
 		return "(пусто)"
 	}
+
 	n := len(s)
 	if n <= 8 {
 		return "*** (длина " + strconv.Itoa(n) + ")"
 	}
+
 	return s[:4] + "*** (длина " + strconv.Itoa(n) + ")"
 }
 
@@ -127,6 +129,7 @@ func Resolve(cfg *config.Config) (Credentials, error) {
 	if cfg == nil {
 		return Credentials{}, errors.New("конфигурация не загружена")
 	}
+
 	c := Credentials{
 		Access:     cfg.Auth.S3Access,
 		Secret:     cfg.Auth.S3Secret,
@@ -136,11 +139,14 @@ func Resolve(cfg *config.Config) (Credentials, error) {
 	if (c.Access == "") != (c.Secret == "") {
 		return Credentials{}, errors.New("s3_access и s3_secret должны быть заданы вместе (оба ключа или ни одного)")
 	}
+
 	if (c.CookieUser == "") != (c.CookieSig == "") {
 		return Credentials{}, errors.New("cookie_user и cookie_sig должны быть заданы вместе (оба куки или ни одного)")
 	}
+
 	haveKeys := c.Access != "" && c.Secret != ""
 	haveCookies := c.CookieUser != "" && c.CookieSig != ""
+
 	switch cfg.SPN2.AuthMode {
 	case "keys":
 		if !haveKeys {
@@ -150,12 +156,14 @@ func Resolve(cfg *config.Config) (Credentials, error) {
 		if !haveCookies {
 			return Credentials{}, errors.New("spn2.auth_mode = \"cookies\", но куки не заданы: заполните cookie_user и cookie_sig в файле конфигурации или выполните wauploader init")
 		}
+
 		return Credentials{CookieUser: c.CookieUser, CookieSig: c.CookieSig}, nil
 	default: // "auto"
 		if !haveKeys && !haveCookies {
 			return Credentials{}, errors.New("не заданы учётные данные archive.org: заполните в файле конфигурации ключи s3_access и s3_secret (получить: https://archive.org/account/s3.php) или куки cookie_user и cookie_sig, либо выполните wauploader init")
 		}
 	}
+
 	return c, nil
 }
 
@@ -166,25 +174,31 @@ func (c Credentials) ValidateKeys(ctx context.Context, cl *httpx.Client) error {
 	if c.Access == "" || c.Secret == "" {
 		return errors.New("проверка ключей невозможна: s3_access или s3_secret не заданы")
 	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, whoamiEndpoint, nil)
 	if err != nil {
 		return fmt.Errorf("проверка ключей: построить запрос whoami: %w", err)
 	}
+
 	req.Header.Set("Authorization", "LOW "+c.Access+":"+c.Secret)
+
 	resp, err := cl.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryIdempotent})
 	if err != nil {
 		return fmt.Errorf("проверка ключей (whoami) не выполнена: %w", err)
 	}
 	defer drainAndClose(resp.Body)
+
 	var payload struct {
 		Success bool `json:"success"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyRead)).Decode(&payload); err != nil {
 		return fmt.Errorf("проверка ключей: неожиданный ответ archive.org (HTTP %d): %w", resp.StatusCode, err)
 	}
+
 	if !payload.Success {
 		return errors.New("ключи s3_access/s3_secret отклонены archive.org (whoami вернул success:false): сгенерируйте новые на https://archive.org/account/s3.php или выполните wauploader init")
 	}
+
 	return nil
 }
 
@@ -199,9 +213,11 @@ func (c Credentials) SPN2Request(req *http.Request) {
 		req.Header.Set("Authorization", "LOW "+c.Access+":"+c.Secret)
 		return
 	}
+
 	if c.CookieUser != "" {
 		req.AddCookie(&http.Cookie{Name: "logged-in-user", Value: c.CookieUser})
 	}
+
 	if c.CookieSig != "" {
 		req.AddCookie(&http.Cookie{Name: "logged-in-sig", Value: c.CookieSig})
 	}
@@ -218,6 +234,7 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	if email == "" {
 		return Credentials{}, errors.New("не указан адрес электронной почты archive.org")
 	}
+
 	if password == "" {
 		return Credentials{}, errors.New("не указан пароль archive.org")
 	}
@@ -228,10 +245,12 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	defer cancelLogin()
 
 	form := url.Values{"email": {email}, "password": {password}}
+
 	req, err := http.NewRequestWithContext(loginCtx, http.MethodPost, xauthnEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org: построить запрос xauthn: %w", err)
 	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := cl.DoWithRetry(loginCtx, req, httpx.RetryOpts{Mode: httpx.RetryConnectOnly})
@@ -248,14 +267,17 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	}()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
+
 	_ = resp.Body.Close()
 	if err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org: чтение ответа (HTTP %d): %w", resp.StatusCode, err)
 	}
+
 	var payload xauthnResponse
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org: неожиданный ответ (HTTP %d): %w", resp.StatusCode, err)
 	}
+
 	if !payload.Success {
 		// The refusal envelope is only trusted on 2xx: a cached or proxy
 		// error page (e.g. 502) that happens to carry success:false must
@@ -263,25 +285,31 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return Credentials{}, refusalError(&payload, raw, resp.StatusCode, email)
 		}
+
 		detail := truncate(strings.TrimSpace(string(raw)), maxErrorBody)
 		if detail == "" {
 			detail = http.StatusText(resp.StatusCode)
 		}
+
 		return Credentials{}, fmt.Errorf("вход archive.org не выполнен (HTTP %d): %s", resp.StatusCode, detail)
 	}
-	v := payload.Values
-	if v.S3.Access == "" || v.S3.Secret == "" {
+
+	values := payload.Values
+	if values.S3.Access == "" || values.S3.Secret == "" {
 		return Credentials{}, errors.New("вход выполнен, но archive.org не вернул S3-ключи: сгенерируйте их вручную на https://archive.org/account/s3.php")
 	}
-	creds = Credentials{Access: v.S3.Access, Secret: v.S3.Secret}
-	if v.Cookies.LoggedInUser == "" || v.Cookies.LoggedInSig == "" {
+
+	creds = Credentials{Access: values.S3.Access, Secret: values.S3.Secret}
+	if values.Cookies.LoggedInUser == "" || values.Cookies.LoggedInSig == "" {
 		// Keys without cookies are a usable state: Resolve accepts
 		// key-only credentials in auto/keys modes, so return the keys and
 		// let the caller decide (persist + warn), never lose them.
 		return creds, ErrCookiesNotReturned
 	}
-	creds.CookieUser = v.Cookies.LoggedInUser
-	creds.CookieSig = v.Cookies.LoggedInSig
+
+	creds.CookieUser = values.Cookies.LoggedInUser
+	creds.CookieSig = values.Cookies.LoggedInSig
+
 	return creds, nil
 }
 
@@ -301,9 +329,11 @@ func refusalError(payload *xauthnResponse, raw []byte, status int, email string)
 		if detail == "" {
 			detail = truncate(strings.TrimSpace(string(raw)), maxErrorBody)
 		}
+
 		if detail == "" {
 			detail = fmt.Sprintf("HTTP %d без тела ответа", status)
 		}
+
 		return fmt.Errorf("вход не выполнен, archive.org не указал причину: %s", detail)
 	default:
 		return fmt.Errorf("вход не выполнен, archive.org вернул причину: %s", payload.Values.Reason)
@@ -316,8 +346,10 @@ func awaitRateCourtesy(ctx context.Context) error {
 	if postLoginPause <= 0 {
 		return nil
 	}
+
 	t := time.NewTimer(postLoginPause)
 	defer t.Stop()
+
 	select {
 	case <-t.C:
 		return nil
@@ -327,17 +359,20 @@ func awaitRateCourtesy(ctx context.Context) error {
 }
 
 // truncate caps s to max runes so error messages stay bounded.
-func truncate(s string, max int) string {
-	if len(s) <= max {
+func truncate(s string, limit int) string {
+	if len(s) <= limit {
 		return s
 	}
+
 	cut := 0
 	for i := range s {
-		if cut == max {
+		if cut == limit {
 			return s[:i] + "…"
 		}
+
 		cut++
 	}
+
 	return s
 }
 
@@ -349,6 +384,7 @@ func sanitizeComment(s string) string {
 		if r < 0x20 || r == 0x7f {
 			return -1
 		}
+
 		return r
 	}, s)
 }
@@ -375,6 +411,7 @@ func SaveToConfig(path string, c Credentials, screenname string) error {
 	if !ok || authSection == nil {
 		authSection = map[string]any{}
 	}
+
 	authSection["s3_access"] = c.Access
 	authSection["s3_secret"] = c.Secret
 	authSection["cookie_user"] = c.CookieUser
@@ -385,6 +422,7 @@ func SaveToConfig(path string, c Credentials, screenname string) error {
 	if screenname != "" {
 		fmt.Fprintf(&buf, "# Аккаунт archive.org: %s\n", sanitizeComment(screenname))
 	}
+
 	if err := toml.NewEncoder(&buf).Encode(base); err != nil {
 		return fmt.Errorf("не удалось сформировать файл конфигурации: %w", err)
 	}
@@ -393,34 +431,43 @@ func SaveToConfig(path string, c Credentials, screenname string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("не удалось создать каталог конфигурации %s: %w", dir, err)
 	}
+
 	tmp, err := os.CreateTemp(dir, ".wauploader-*.tmp")
 	if err != nil {
 		return fmt.Errorf("не удалось создать временный файл конфигурации в %s: %w", dir, err)
 	}
+
 	tmpName := tmp.Name()
 	defer func() {
 		if tmpName != "" {
 			_ = os.Remove(tmpName)
 		}
 	}()
+
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("не удалось установить права на временный файл конфигурации: %w", err)
 	}
+
 	if _, err := tmp.WriteString(buf.String()); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("не удалось записать файл конфигурации %s: %w", path, err)
 	}
+
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("не удалось записать файл конфигурации %s: %w", path, err)
 	}
+
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("не удалось сохранить файл конфигурации %s: %w", path, err)
 	}
+
 	tmpName = "" // renamed into place; nothing left to clean up
+
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("не удалось установить права 0600 на файл конфигурации %s: %w", path, err)
 	}
+
 	return nil
 }
 

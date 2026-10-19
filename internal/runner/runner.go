@@ -63,25 +63,32 @@ func (l Limits) Validate() error {
 	if l.PerMinute <= 0 {
 		return fmt.Errorf("save_per_minute должен быть не меньше 1 (сейчас %v)", l.PerMinute)
 	}
+
 	if l.Concurrency < 1 {
 		return fmt.Errorf("save_concurrency должен быть не меньше 1 (сейчас %d)", l.Concurrency)
 	}
+
 	if l.PerHost < 1 || l.PerHost > maxPerHost {
 		return fmt.Errorf("per_host_concurrency должен быть от 1 до %d (сейчас %d)", maxPerHost, l.PerHost)
 	}
+
 	if l.JobWait <= 0 {
 		return errors.New("job_wait должен быть положительным (например \"20m\")")
 	}
+
 	pollStart, pollMax := l.PollStart, l.PollMax
 	if pollStart <= 0 {
 		pollStart = defaultPollStart
 	}
+
 	if pollMax <= 0 {
 		pollMax = defaultPollMax
 	}
+
 	if pollMax < pollStart {
 		return fmt.Errorf("poll_max (%v) должен быть не меньше poll_start (%v)", pollMax, pollStart)
 	}
+
 	return nil
 }
 
@@ -91,12 +98,15 @@ func (l Limits) withDefaults() Limits {
 	if l.PollStart <= 0 {
 		l.PollStart = defaultPollStart
 	}
+
 	if l.PollMax <= 0 {
 		l.PollMax = defaultPollMax
 	}
+
 	if l.PollMax < l.PollStart {
 		l.PollMax = l.PollStart
 	}
+
 	return l
 }
 
@@ -119,15 +129,18 @@ func newHostLimiters(capacity int) *hostLimiters {
 // returned release function is never nil when err is nil.
 func (h *hostLimiters) acquire(ctx context.Context, host string) (func(), error) {
 	h.mu.Lock()
+
 	sem, ok := h.hosts[host]
 	if !ok {
 		sem = semaphore.NewWeighted(h.cap)
 		h.hosts[host] = sem
 	}
 	h.mu.Unlock()
+
 	if err := sem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
+
 	return func() { sem.Release(1) }, nil
 }
 
@@ -139,6 +152,7 @@ func hostOf(target string) string {
 	if err != nil || u.Host == "" {
 		return target
 	}
+
 	return strings.ToLower(u.Host)
 }
 
@@ -148,8 +162,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
+
 	t := time.NewTimer(d)
 	defer t.Stop()
+
 	select {
 	case <-ctx.Done():
 		return false
@@ -163,5 +179,6 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func untilMidnight() time.Duration {
 	now := time.Now()
 	next := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Add(24 * time.Hour)
+
 	return next.Sub(now)
 }

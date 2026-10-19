@@ -133,10 +133,12 @@ func (c *Client) CheckLimit(ctx context.Context, identifier string) (overLimit b
 	if c.creds.Access == "" {
 		return true, errors.New("префлайт check_limit невозможен: s3_access не задан в конфигурации")
 	}
+
 	q := url.Values{}
 	q.Set("check_limit", "1")
 	q.Set("accesskey", c.creds.Access)
 	q.Set("bucket", identifier)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/?"+q.Encode(), nil)
 	if err != nil {
 		return true, fmt.Errorf("префлайт check_limit: построить запрос: %w", sanitizeReqErr(err))
@@ -151,21 +153,26 @@ func (c *Client) CheckLimit(ctx context.Context, identifier string) (overLimit b
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
 		_ = resp.Body.Close()
 	}()
+
 	if resp.StatusCode != http.StatusOK {
 		return true, fmt.Errorf("префлайт check_limit: неожиданный HTTP %d (считаем лимит исчерпанным)", resp.StatusCode)
 	}
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 	if err != nil {
 		return true, fmt.Errorf("префлайт check_limit: чтение ответа: %w", err)
 	}
+
 	var payload checkLimitPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return true, fmt.Errorf("префлайт check_limit: ответ не разобран (считаем лимит исчерпанным): %w", err)
 	}
+
 	over, perr := parseOverLimit(payload.OverLimit)
 	if perr != nil {
 		return true, fmt.Errorf("префлайт check_limit: поле over_limit не распознано (считаем лимит исчерпанным): %w", perr)
 	}
+
 	return over, nil
 }
 
@@ -176,10 +183,12 @@ func parseOverLimit(raw json.RawMessage) (bool, error) {
 	if err := json.Unmarshal(raw, &b); err == nil {
 		return b, nil
 	}
+
 	var n int
 	if err := json.Unmarshal(raw, &n); err == nil {
 		return n != 0, nil
 	}
+
 	return false, fmt.Errorf("ожидается bool или число, получено: %s", truncateFragment(string(raw)))
 }
 
@@ -202,10 +211,12 @@ const maxCheckLimitErrors = 8
 // broken, not busy. A successful check resets the counter.
 func AwaitNotOverLimit(ctx context.Context, c *Client, identifier string) error {
 	consecutiveErrs := 0
+
 	for {
 		over, err := c.CheckLimit(ctx, identifier)
 		if err == nil {
 			consecutiveErrs = 0
+
 			if !over {
 				return nil
 			}
@@ -215,9 +226,11 @@ func AwaitNotOverLimit(ctx context.Context, c *Client, identifier string) error 
 				return fmt.Errorf("проверка лимита очереди стабильно падает (%d попыток подряд), загрузка отменена: %w", maxCheckLimitErrors, err)
 			}
 		}
+
 		if cerr := ctx.Err(); cerr != nil {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", cerr)
 		}
+
 		if !sleepCtx(ctx, CheckLimitPoll) {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", ctx.Err())
 		}
@@ -234,6 +247,7 @@ func sanitizeReqErr(err error) error {
 	if errors.As(err, &urlErr) {
 		return urlErr.Err
 	}
+
 	return err
 }
 
@@ -242,8 +256,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
+
 	t := time.NewTimer(d)
 	defer t.Stop()
+
 	select {
 	case <-t.C:
 		return true
@@ -281,21 +297,27 @@ type S3Error struct {
 func (e *S3Error) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "archive.org вернул ошибку (HTTP %d", e.StatusCode)
+
 	if e.Code != "" {
 		fmt.Fprintf(&b, ", код %s", e.Code)
 	}
+
 	b.WriteString("): ")
-	if e.Message != "" {
+
+	switch {
+	case e.Message != "":
 		b.WriteString(e.Message)
-	} else if e.bodyFragment != "" {
+	case e.bodyFragment != "":
 		b.WriteString("тело ответа: ")
 		b.WriteString(e.bodyFragment)
-	} else {
+	default:
 		b.WriteString(http.StatusText(e.StatusCode))
 	}
+
 	if e.RequestID != "" {
 		fmt.Fprintf(&b, " [RequestID %s]", e.RequestID)
 	}
+
 	return b.String()
 }
 
@@ -308,6 +330,7 @@ func parseS3ErrorBody(raw []byte) (parsed s3ErrorXML, ok bool) {
 	if err := xml.Unmarshal(raw, &e); err != nil || e.Code == "" {
 		return e, false
 	}
+
 	return e, true
 }
 
@@ -316,6 +339,7 @@ func truncateFragment(s string) string {
 	if len(s) <= maxErrorFragment {
 		return s
 	}
+
 	return s[:maxErrorFragment] + "…"
 }
 
@@ -336,6 +360,7 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 			cr.fn(cr.n)
 		}
 	}
+
 	return n, err
 }
 
@@ -370,10 +395,11 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 // frequent IA-S3 307 redirects are followed with replayable bodies and
 // the httpx *.archive.org Authorization policy applies on every hop.
 // progress (may be nil) reports bytes sent within the current attempt.
-func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, progress func(sent int64)) error {
+func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, progress func(sent int64)) error { //nolint:gocognit,gocyclo // upload pipeline stages (preflight/PUT/SlowDown/spam) mirror the wire; 60 gocognit / 39 gocyclo vs caps 30/20
 	if err := ValidateIdentifier(req.Identifier); err != nil {
 		return err
 	}
+
 	if req.Key == "" {
 		return errors.New("не указано имя файла (key) для загрузки в элемент")
 	}
@@ -383,9 +409,11 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 	if req.Key == req.Identifier+"_meta.xml" || req.Key == req.Identifier+"_files.xml" {
 		return fmt.Errorf("файл «%s» — служебный файл archive.org — загрузка запрещена: его перезапись повредит элемент", req.Key)
 	}
+
 	if c.creds.Access == "" || c.creds.Secret == "" {
 		return errors.New("загрузка невозможна: s3_access или s3_secret не заданы в конфигурации")
 	}
+
 	if err := validateExtraMeta(o.Extra); err != nil {
 		return err
 	}
@@ -400,10 +428,12 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 	if err != nil {
 		return fmt.Errorf("не удалось получить размер файла %s: %w", req.Path, err)
 	}
+
 	size := req.Size
 	if size <= 0 {
 		size = st.Size()
 	}
+
 	if size != st.Size() {
 		return fmt.Errorf("размер файла %s (%d байт) не совпадает с указанным (%d байт): файл изменился после подготовки — пересчитайте размер и контрольную сумму",
 			req.Path, st.Size(), size)
@@ -415,16 +445,20 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("не удалось вернуться к началу файла %s: %w", req.Path, err)
 		}
+
 		body := &countingReader{r: f, fn: progress}
+
 		put, err := http.NewRequestWithContext(ctx, http.MethodPut, c.fileURL(req.Identifier, req.Key), body)
 		if err != nil {
 			return fmt.Errorf("построить PUT-запрос: %w", err)
 		}
+
 		for k, vs := range hdrs {
 			for _, v := range vs {
 				put.Header.Set(k, v)
 			}
 		}
+
 		if req.MD5Hex != "" {
 			put.Header.Set("Content-MD5", req.MD5Hex)
 		}
@@ -439,6 +473,7 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 			if _, err := f.Seek(0, io.SeekStart); err != nil {
 				return nil, fmt.Errorf("не удалось вернуться к началу файла %s: %w", req.Path, err)
 			}
+
 			return io.NopCloser(&countingReader{r: f, fn: progress}), nil
 		}
 		c.setAuth(put)
@@ -449,9 +484,11 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 		if err != nil {
 			return fmt.Errorf("загрузка %s не выполнена: %w", req.Key, err)
 		}
+
 		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
 		_ = resp.Body.Close()
+
 		status := resp.StatusCode
 		if readErr != nil && len(raw) == 0 {
 			return fmt.Errorf("загрузка %s: чтение ответа (HTTP %d): %w", req.Key, status, readErr)
@@ -493,12 +530,15 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 			if status == http.StatusTooManyRequests {
 				wait = retryAfterPause(resp.Header)
 			}
+
 			if !sleepCtx(ctx, wait) {
 				return fmt.Errorf("загрузка %s прервана во время ожидания после HTTP %d: %w", req.Key, status, ctx.Err())
 			}
+
 			if err := AwaitNotOverLimit(ctx, c, req.Identifier); err != nil {
 				return fmt.Errorf("загрузка %s: %w", req.Key, err)
 			}
+
 			continue // whole-file re-PUT
 		}
 
@@ -511,6 +551,7 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 				RequestID:  parsed.RequestID,
 			}
 		}
+
 		return &S3Error{
 			StatusCode:   status,
 			bodyFragment: truncateFragment(string(raw)),
@@ -530,10 +571,12 @@ func retryAfterPause(h http.Header) time.Duration {
 	if err != nil || secs <= 0 {
 		return slowDownWait
 	}
+
 	wait := time.Duration(secs) * retryAfterUnit
 	if wait <= 0 || wait > slowDownWait {
 		return slowDownWait
 	}
+
 	return wait
 }
 
@@ -549,6 +592,7 @@ func budgetExhaustedError(status int, parsed s3ErrorXML, xmlOK bool, raw []byte)
 			RequestID:  parsed.RequestID,
 		}
 	}
+
 	return &S3Error{
 		StatusCode:   status,
 		Message:      fmt.Sprintf("исчерпан бюджет попыток (%d), archive.org продолжает отвечать ошибкой", maxUploadAttempts),
