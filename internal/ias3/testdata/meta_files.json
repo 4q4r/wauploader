@@ -1,0 +1,43 @@
+{
+  "metadata": {
+    "identifier": "testid1",
+    "mediatype": "data",
+    "collection": ["test_collection"]
+  },
+  "files": [
+    {
+      "name": "file.bin",
+      "source": "original",
+      "format": "Binary File",
+      "mtime": "1760000000",
+      "size": "5",
+      "md5": "5d41402abc4b2a76b9719d911017c592",
+      "crc32": "2ef17948",
+      "sha1": "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+    },
+    {
+      "name": "second.dat",
+      "source": "original",
+      "format": "Data",
+      "mtime": 1760000001,
+      "size": 12345,
+      "md5": "d41d8cd98f00b204e9800998ecf8427e",
+      "crc32": "00000000",
+      "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    },
+    {
+      "name": "nomd5.bin",
+      "source": "derivative",
+      "format": "Text",
+      "mtime": "1760000002",
+      "size": "1"
+    }
+  ],
+  "item_size": 12351,
+  "files_count": 3,
+  "server": "ia801234",
+  "d1": "ia801234",
+  "d2": "ia801235",
+  "dir": "/12/items/testid1",
+  "workable_servers": ["ia801234", "ia801235"]
+}
