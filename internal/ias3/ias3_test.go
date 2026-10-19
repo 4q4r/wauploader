@@ -460,3 +460,66 @@ func TestUploadInvalidExtraMetaName(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "1bad")
 }
+
+// --- fix round 1: managed-key guard, accesskey redaction, brackets -------
+
+func TestUploadManagedKeyRejected(t *testing.T) {
+	requests := 0
+	cl, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
+		w.WriteHeader(http.StatusOK)
+	}))
+	path := writeTempFile(t, "x")
+	opts := HeaderOpts{Mediatype: "data"}
+	for _, key := range []string{"testid1_meta.xml", "testid1_files.xml"} {
+		err := cl.Upload(context.Background(), UploadRequest{
+			Identifier: "testid1", Key: key, Path: path, Size: 1,
+		}, opts, nil)
+		require.Errorf(t, err, "managed key %q must be rejected", key)
+		assert.Contains(t, err.Error(), key, "the error must name the offending key")
+		assert.Contains(t, err.Error(), "служебный файл archive.org — загрузка запрещена")
+	}
+	// A near-miss key is not managed and must go through.
+	err := cl.Upload(context.Background(), UploadRequest{
+		Identifier: "testid1", Key: "testid12_meta.xml", Path: path, Size: 1,
+	}, opts, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests, "only the near-miss key must reach the wire")
+}
+
+func TestCheckLimitErrorRedactsAccessKey(t *testing.T) {
+	// Deterministic transport-level failure carrying a *url.Error: a
+	// redirect loop. httpx never retries ErrTooManyRedirects, so
+	// DoWithRetry returns the wrapped error whose text includes the full
+	// request URL — query string with the access key included.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, r.URL.String(), http.StatusFound)
+	}))
+	t.Cleanup(ts.Close)
+	cl := NewClient(httpx.NewClient(nil, "wauploader/test"), auth.Credentials{Access: "AKIAIOSFODNN7EXAMPLE", Secret: "wJalrXUtnFEMI"})
+	cl.base = ts.URL
+
+	over, err := cl.CheckLimit(context.Background(), "testid1")
+	assert.True(t, over, "transport failure must fail safe to overloaded")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many redirects", "the underlying cause must survive sanitization")
+	assert.NotContains(t, err.Error(), "accesskey=", "the raw URL must never leak into the error")
+	assert.NotContains(t, err.Error(), "AKIAIOSFODNN7EXAMPLE", "the key value must never leak into the error")
+}
+
+func TestUploadBracketedMetaNameRejected(t *testing.T) {
+	requests := 0
+	cl, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	path := writeTempFile(t, "x")
+	err := cl.Upload(context.Background(), UploadRequest{
+		Identifier: "testid1", Key: "f", Path: path, Size: 1,
+	}, HeaderOpts{Mediatype: "data", Extra: Meta{"name[0]": {"v"}}}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "name[0]", "the error must name the offending key")
+	assert.Contains(t, err.Error(), "не поддерживаются S3-заголовками")
+	assert.Equal(t, 0, requests, "must fail fast before any HTTP request")
+}

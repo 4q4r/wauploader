@@ -42,9 +42,11 @@ type HeaderOpts struct {
 	Description string // optional convenience metadata
 
 	// Extra holds arbitrary x-archive-meta-* fields. Names must match the
-	// reference validator ^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$ (the
-	// bracketed suffix form is accepted for contract parity but only plain
-	// names can ride S3 headers; Upload rejects invalid names in Russian).
+	// reference validator ^[A-Za-z][.\-0-9A-Za-z_]+ minus the numeric
+	// bracket suffix: bracketed names are legal metadata keys in the JSON
+	// Item Metadata API but cannot ride S3 header names, so Upload rejects
+	// them (and any other invalid name) fail-fast in Russian — see
+	// validateExtraMeta.
 	Extra Meta
 
 	AutoMakeBucket          bool // x-archive-auto-make-bucket: 1 — create the item on this PUT
@@ -124,19 +126,29 @@ func boolToHeader(b bool) string {
 // optional numeric bracket suffix.
 var metaNameRe = regexp.MustCompile(`^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$`)
 
-// validateExtraMeta checks every Extra key against the reference validator
-// and returns one Russian error naming every invalid key. Names spelled
-// with "--" are accepted: they are translated to "_" for the wire because
-// RFC 822 header names cannot carry underscores (IA translates them back).
+// validateExtraMeta checks every Extra key and returns one Russian error
+// naming every invalid key. Two rejection classes: bracketed names —
+// legal metadata keys in the JSON Item Metadata API, but S3 header names
+// cannot contain "[" or "]" — and names failing the reference validator
+// ^[A-Za-z][.\-0-9A-Za-z_]+(?:\[[0-9]+\])?$. Names spelled with "--" are
+// accepted: they are translated to "_" for the wire because RFC 822
+// header names cannot carry underscores (IA translates them back).
 func validateExtraMeta(m Meta) error {
 	if len(m) == 0 {
 		return nil
 	}
-	var bad []string
+	var bad, bracketed []string
 	for name := range m {
-		if !metaNameRe.MatchString(name) {
+		switch {
+		case strings.ContainsAny(name, "[]"):
+			bracketed = append(bracketed, "«"+name+"»")
+		case !metaNameRe.MatchString(name):
 			bad = append(bad, "«"+name+"»")
 		}
+	}
+	if len(bracketed) > 0 {
+		return fmt.Errorf("недопустимые имена метаданных: %s — имена метаданных со скобками не поддерживаются S3-заголовками (передавайте такие поля через Item Metadata API)",
+			strings.Join(bracketed, ", "))
 	}
 	if len(bad) == 0 {
 		return nil

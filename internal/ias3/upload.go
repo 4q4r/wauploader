@@ -125,13 +125,13 @@ func (c *Client) CheckLimit(ctx context.Context, identifier string) (overLimit b
 	q.Set("bucket", identifier)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/?"+q.Encode(), nil)
 	if err != nil {
-		return true, fmt.Errorf("префлайт check_limit: построить запрос: %w", err)
+		return true, fmt.Errorf("префлайт check_limit: построить запрос: %w", sanitizeReqErr(err))
 	}
 	// No Authorization header: the reference client sends the access key
 	// in the query and nothing else for this endpoint (r2 §4.2).
 	resp, err := c.hc.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryIdempotent})
 	if err != nil {
-		return true, fmt.Errorf("префлайт check_limit не выполнен (считаем лимит исчерпанным): %w", err)
+		return true, fmt.Errorf("не удалось проверить лимит очереди для %s (считаем лимит исчерпанным): %w", identifier, sanitizeReqErr(err))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
@@ -186,6 +186,19 @@ func awaitNotOverLimit(ctx context.Context, c *Client, identifier string) error 
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", ctx.Err())
 		}
 	}
+}
+
+// sanitizeReqErr strips the *url.Error wrapper from transport and parse
+// errors: its text prints the full request URL, and the check_limit URL
+// carries the access key in its query (documented wire shape) — a global
+// constraint forbids secrets in error messages. The underlying cause
+// (dial failure, redirect cap, deadline) survives the unwrap.
+func sanitizeReqErr(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
 
 // sleepCtx waits for d, returning false as soon as ctx ends.
@@ -324,6 +337,12 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 	}
 	if req.Key == "" {
 		return errors.New("не указано имя файла (key) для загрузки в элемент")
+	}
+	// The item's <id>_meta.xml and <id>_files.xml are IA-managed: a PUT
+	// would clobber the item's metadata/descriptor (realistic trigger:
+	// re-uploading a mirrored item directory). Exact, case-sensitive match.
+	if req.Key == req.Identifier+"_meta.xml" || req.Key == req.Identifier+"_files.xml" {
+		return fmt.Errorf("файл «%s» — служебный файл archive.org — загрузка запрещена: его перезапись повредит элемент", req.Key)
 	}
 	if c.creds.Access == "" || c.creds.Secret == "" {
 		return errors.New("загрузка невозможна: s3_access или s3_secret не заданы в конфигурации")
