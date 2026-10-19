@@ -43,8 +43,10 @@ var (
 )
 
 // maxLoginTimeout bounds a single xauthn exchange; the reference client
-// uses 10s, doubled here because IA services can be slow (plan T5).
-const maxLoginTimeout = 30 * time.Second
+// uses 10s, doubled here because IA services can be slow (plan T5). It is
+// a package-level var so tests can shrink it (same pattern as
+// postLoginPause); tests run sequentially, making the mutation race-free.
+var maxLoginTimeout = 30 * time.Second
 
 // maxBodyRead caps how many response bytes are read before parsing.
 const maxBodyRead = 1 << 20
@@ -211,25 +213,30 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	if password == "" {
 		return Credentials{}, errors.New("не указан пароль archive.org")
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxLoginTimeout)
-	defer cancel()
+	// The login deadline bounds only the exchange itself; the courtesy
+	// pause below runs on the caller's ctx, so a near-deadline success is
+	// never overwritten by a pause error.
+	loginCtx, cancelLogin := context.WithTimeout(ctx, maxLoginTimeout)
+	defer cancelLogin()
 
 	form := url.Values{"email": {email}, "password": {password}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, xauthnEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(loginCtx, http.MethodPost, xauthnEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org: построить запрос xauthn: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := cl.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryConnectOnly})
+	resp, err := cl.DoWithRetry(loginCtx, req, httpx.RetryOpts{Mode: httpx.RetryConnectOnly})
 	if err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org (xauthn) не выполнен: %w", err)
 	}
 	// Reference behavior: sleep after the call, on every answered path.
+	// The pause uses the PARENT context (the login deadline may be nearly
+	// spent when the exchange completes) and its outcome never overwrites
+	// the exchange result: a pause interrupted by context cancellation
+	// must not replace fresh credentials with a pause error.
 	defer func() {
-		if perr := awaitRateCourtesy(ctx); perr != nil && err == nil {
-			creds, err = Credentials{}, perr
-		}
+		_ = awaitRateCourtesy(ctx)
 	}()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))

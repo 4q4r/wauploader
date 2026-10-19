@@ -32,6 +32,15 @@ func overridePause(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { postLoginPause = old })
 }
 
+// overrideLoginTimeout swaps the xauthn login deadline for the test
+// duration, so the near-deadline pause scenario needs no 30s wait.
+func overrideLoginTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := maxLoginTimeout
+	maxLoginTimeout = d
+	t.Cleanup(func() { maxLoginTimeout = old })
+}
+
 // newTestClient builds an httpx client for the fakes below; every request
 // URL comes from the overridden endpoint vars, never from archive.org.
 func newTestClient(t *testing.T) *httpx.Client {
@@ -176,6 +185,42 @@ func TestBootstrapRateCourtesyPause(t *testing.T) {
 	}
 	if elapsed < 25*time.Millisecond {
 		t.Errorf("Bootstrap returned in %v, want >= 25ms courtesy pause after the call", elapsed)
+	}
+}
+
+// TestBootstrapPauseNearDeadlineKeepsCredentials reproduces the
+// courtesy-pause landmine: when the xauthn exchange succeeds near the
+// login deadline, the pause must not clobber the fresh credentials. The
+// pause runs on the PARENT context, so a nearly expired login deadline
+// cannot turn a successful exchange into a pause error.
+func TestBootstrapPauseNearDeadlineKeepsCredentials(t *testing.T) {
+	overridePause(t, 100*time.Millisecond)       // longer than the remaining child deadline
+	overrideLoginTimeout(t, 60*time.Millisecond) // the login deadline
+	// The fake server answers after ~40ms: the exchange succeeds with
+	// roughly 20ms of child deadline left — the old child-scoped pause
+	// always saw ctx expiry there and replaced the result with an error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(successBody()))
+	}))
+	t.Cleanup(srv.Close)
+	overrideEndpoint(t, &xauthnEndpoint, srv.URL+"/services/xauthn/?op=login")
+
+	start := time.Now()
+	creds, err := Bootstrap(context.Background(), newTestClient(t), testEmail, testPassword)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Bootstrap returned error despite a successful exchange: %v", err)
+	}
+	if creds.Access != testAccess || creds.Secret != testSecret {
+		t.Errorf("successful exchange lost its credentials: %+v", creds.String())
+	}
+	if creds.CookieUser != testUser || creds.CookieSig != testSig {
+		t.Errorf("successful exchange lost its cookies: %s", creds.String())
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("Bootstrap returned in %v, want the full %v courtesy pause before returning", elapsed, 100*time.Millisecond)
 	}
 }
 
