@@ -17,7 +17,7 @@
 //     charged (the record stays queued for the next run).
 //   - user-session-limit is special-cased before quota parking: the
 //     runner polls UserStatus and waits while processing >= available,
-//     then retries, because the session frees as in-flight jobs finish;
+//     then retries, because in-flight jobs normally free the session;
 //     the wait is expected behavior and does not consume the resubmit
 //     budget.
 //   - Job-state error documents from the status endpoint are classified
