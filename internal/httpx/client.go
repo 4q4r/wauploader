@@ -8,6 +8,7 @@
 package httpx
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -21,6 +22,11 @@ import (
 // CheckRedirect on Client must reproduce it because setting the field
 // disables the built-in default.
 const maxRedirects = 10
+
+// ErrTooManyRedirects reports that a redirect chain hit the 10-hop
+// cap. It is terminal: resending cannot help, so DoWithRetry never
+// retries it.
+var ErrTooManyRedirects = errors.New("httpx: too many redirects")
 
 // Client wraps a standard http.Client configured for archive.org
 // services. The zero value is not usable; construct with NewClient.
@@ -98,7 +104,7 @@ func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // would normally keep.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
-		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		return fmt.Errorf("%w: stopped after %d redirects", ErrTooManyRedirects, maxRedirects)
 	}
 	if len(via) == 0 {
 		return nil

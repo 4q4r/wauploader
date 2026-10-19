@@ -141,6 +141,31 @@ func TestRetryContextCancelDuringBackoff(t *testing.T) {
 	}
 }
 
+// TestRetryRedirectCapNotRetried: a redirect loop is terminal — the
+// redirect-cap error must surface unwrapped to ErrTooManyRedirects
+// after exactly ONE attempt, never burn the retry budget.
+func TestRetryRedirectCapNotRetried(t *testing.T) {
+	var attempts atomic.Int64
+	srv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		attempts.Add(1)
+		nethttp.Redirect(w, r, "/next", nethttp.StatusFound)
+	}))
+	defer srv.Close()
+
+	cl := NewClient(nil, "test-ua")
+	req, _ := nethttp.NewRequest(nethttp.MethodGet, srv.URL, nil)
+	_, err := cl.DoWithRetry(t.Context(), req, fastOpts(RetryIdempotent, 3))
+	if !errors.Is(err, ErrTooManyRedirects) {
+		t.Fatalf("err = %v, want errors.Is(err, ErrTooManyRedirects)", err)
+	}
+	if got := attempts.Load(); got != maxRedirects {
+		// The 10 redirect hops all happen inside ONE c.HTTP.Do call;
+		// the terminal assertion is that DoWithRetry did NOT resend
+		// (which would be 3 × 10 = 30 hits under fastOpts).
+		t.Errorf("attempts = %d, want exactly %d (one Do call hitting the cap, zero resends)", got, maxRedirects)
+	}
+}
+
 // TestRetryBudgetExceeded: when every attempt returns a retryable
 // status, the final error wraps ErrRetryBudgetExceeded and exactly
 // MaxAttempts requests were made.

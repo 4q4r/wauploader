@@ -173,8 +173,10 @@ func retryableStatus(mode RetryMode, code int) bool {
 func retryableTransport(mode RetryMode, err error) bool {
 	switch mode {
 	case RetryIdempotent:
-		// Replay of an idempotent request is always safe.
-		return true
+		// Replay of an idempotent request is safe, but a redirect loop
+		// is a diagnosis, not a transient fault: resending cannot help,
+		// so surface it after the first attempt.
+		return !errors.Is(err, ErrTooManyRedirects)
 	case RetryConnectOnly:
 		return connectPhase(err)
 	default:
