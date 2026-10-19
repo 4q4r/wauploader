@@ -33,7 +33,7 @@ func NewJobsCommand(journalPath *string, noColor *bool) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "jobs [--state failed|queued|pending|done] [--clear]",
 		Short:        "Показать записи журнала выполнения; --clear удаляет отфильтрованные записи",
-		Args:         cobra.NoArgs,
+		Args:         usageNoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runJobs(cmd, derefString(journalPath, ""), stateArg, doClear, derefBool(noColor))

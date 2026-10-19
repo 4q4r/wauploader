@@ -66,6 +66,12 @@ type fakeIAS3 struct {
 	putFn      func(identifier, key string, nth int) int
 	taskFn     func(identifier string, nth int) string
 	failChecks bool
+
+	// blockPutUntilCancel / blockMetaUntilCancel make the PUT / metadata
+	// handler hang until the request context is cancelled — the mid-flight
+	// interrupt tests (cancel lands while the stage is in flight).
+	blockPutUntilCancel  bool
+	blockMetaUntilCancel bool
 }
 
 type metaEntry struct {
@@ -120,6 +126,15 @@ func (f *fakeIAS3) handlePut(w http.ResponseWriter, r *http.Request) {
 	if f.holds > 0 {
 		time.Sleep(f.holds)
 	}
+	f.mu.Lock()
+	blocked := f.blockPutUntilCancel
+	f.mu.Unlock()
+	if blocked {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}
 	code := http.StatusOK
 	if f.putFn != nil {
 		code = f.putFn(id, key, nth)
@@ -163,6 +178,17 @@ func (f *fakeIAS3) handleMeta(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.metaCalls++
 	files := f.metaFiles[id]
+	f.mu.Unlock()
+	f.mu.Lock()
+	blocked := f.blockMetaUntilCancel
+	f.mu.Unlock()
+	if blocked {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}
+	f.mu.Lock()
 	var b strings.Builder
 	b.WriteString(`{"files":[`)
 	for i, e := range files {
@@ -358,6 +384,26 @@ func (f *fakeIAS3) checkCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.checks
+}
+
+func (f *fakeIAS3) metaCallsTotal() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.metaCalls
+}
+
+// setBlockPutUntilCancel / setBlockMetaUntilCancel flip the interrupt-test
+// hold flags under the fake's mutex (the handler goroutines read them).
+func (f *fakeIAS3) setBlockPutUntilCancel(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blockPutUntilCancel = v
+}
+
+func (f *fakeIAS3) setBlockMetaUntilCancel(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blockMetaUntilCancel = v
 }
 
 // --- tests ------------------------------------------------------------------
@@ -860,4 +906,86 @@ func TestBadCredentialsPausesQueue(t *testing.T) {
 	rec := mustUploadRecord(t, st, tgts[0])
 	assert.Equal(t, journal.StateFailed, rec.State)
 	assert.Equal(t, journal.StateQueued, mustUploadRecord(t, st, tgts[1]).State)
+}
+
+// TestCancelMidUploadLeavesQueuedAndResumes: a context cancel while the
+// PUT is in flight is an interruption, not a per-file failure — the
+// record must stay queued (digests already persisted), so the exit-1
+// message «часть задач осталась в журнале и продолжится» stays true and
+// the next run's resume scan finishes the file.
+func TestCancelMidUploadLeavesQueuedAndResumes(t *testing.T) {
+	paths := writeUploadFiles(t, "interrupt-me")
+	f := newFakeIAS3(t)
+	f.blockPutUntilCancel = true
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-cancelput1")
+	ctx, cancel := context.WithCancel(context.Background())
+	canceler := make(chan struct{})
+	go func() {
+		defer close(canceler)
+		assert.Eventually(t, func() bool { return f.puts("file1.bin") == 1 },
+			2*time.Second, 2*time.Millisecond, "the PUT must start before the cancel")
+		cancel()
+	}()
+	got, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), false, false)
+	<-canceler
+	require.ErrorIs(t, err, context.Canceled, "a cancelled run surfaces as the completion error")
+
+	rec := mustUploadRecord(t, st, tgts[0])
+	require.Equal(t, journal.StateQueued, rec.State,
+		"cancel mid-PUT must leave the record queued (resumable), not failed")
+	require.NotEmpty(t, rec.MD5, "digests are persisted while queued, so resume never re-hashes")
+	for _, ev := range got {
+		if ev.Target == uploadRecordTarget(tgts[0]) && ev.State == journal.StateFailed {
+			t.Fatalf("an interrupted PUT must not journal failed: %+v", ev)
+		}
+	}
+
+	// The next run's resume scan picks the queued record up and finishes it.
+	f.setBlockPutUntilCancel(false)
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	_, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
+}
+
+// TestCancelMidVerifyLeavesQueuedAndResumes: the preserved M-2 ruling —
+// a cancel during the post-PUT verify leaves the record queued (the PUT
+// succeeded and the digests are persisted), so the next run re-uploads
+// idempotently and re-verifies to done; the file never becomes failed.
+func TestCancelMidVerifyLeavesQueuedAndResumes(t *testing.T) {
+	paths := writeUploadFiles(t, "verify-interrupt")
+	f := newFakeIAS3(t)
+	f.blockMetaUntilCancel = true
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-cancelver1")
+	ctx, cancel := context.WithCancel(context.Background())
+	canceler := make(chan struct{})
+	go func() {
+		defer close(canceler)
+		assert.Eventually(t, func() bool { return f.metaCallsTotal() >= 1 },
+			2*time.Second, 2*time.Millisecond, "verify must reach the metadata API (PUT already done)")
+		cancel()
+	}()
+	_, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), true /* verify */, false)
+	<-canceler
+	require.ErrorIs(t, err, context.Canceled)
+
+	rec := mustUploadRecord(t, st, tgts[0])
+	require.Equal(t, journal.StateQueued, rec.State,
+		"cancel during verify must leave the record queued (M-2 ruling), not failed")
+	require.NotEmpty(t, rec.MD5, "digests are persisted while queued")
+
+	// Resume: healthy metadata with the matching digest — the run finishes.
+	f.setBlockMetaUntilCancel(false)
+	sum5 := md5.Sum([]byte("verify-interrupt"))
+	f.metaFiles["testid-cancelver1"] = []metaEntry{{name: "file1.bin", md5: hex.EncodeToString(sum5[:])}}
+	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
+	_, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), true, false)
+	require.NoError(t, err)
+	require.Equal(t, 1, sum2.Done)
+	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
 }

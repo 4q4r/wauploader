@@ -62,6 +62,20 @@ const maxErrorBody = 200
 // failing. It never wraps other errors.
 var ErrCookiesNotReturned = errors.New("куки не получены — SPN2 будет работать по ключам")
 
+// ErrLoginRefused marks a definitive xauthn credential refusal (unknown
+// account, wrong password). It is matched via errors.Is, never by value:
+// refusalError produces it through *loginRefusedError, whose Error() is
+// the user-visible Russian text.
+var ErrLoginRefused = errors.New("вход archive.org отклонён")
+
+// loginRefusedError carries one refusal's Russian text and classifies as
+// ErrLoginRefused so the command layer can map it to the auth exit code.
+type loginRefusedError struct{ msg string }
+
+func (e *loginRefusedError) Error() string { return e.msg }
+
+func (e *loginRefusedError) Is(target error) bool { return target == ErrLoginRefused }
+
 // Credentials holds one archive.org identity: IA-S3 keys and the SPN2 login
 // cookies. Any subset may be populated; Resolve guarantees at least one
 // usable form for the selected auth mode.
@@ -321,9 +335,9 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 func refusalError(payload *xauthnResponse, raw []byte, status int, email string) error {
 	switch payload.Values.Reason {
 	case "account_not_found":
-		return fmt.Errorf("аккаунт archive.org с адресом %s не найден", email)
+		return &loginRefusedError{fmt.Sprintf("аккаунт archive.org с адресом %s не найден", email)}
 	case "account_bad_password":
-		return errors.New("неверный пароль учётной записи archive.org")
+		return &loginRefusedError{"неверный пароль учётной записи archive.org"}
 	case "":
 		detail := payload.Error
 		if detail == "" {

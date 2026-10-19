@@ -38,7 +38,7 @@ func NewInitCommand(configPath *string, jsonOut, noColor *bool) *cobra.Command {
 	return &cobra.Command{
 		Use:          "init",
 		Short:        "Получить ключи archive.org по email и паролю и записать их в конфигурацию",
-		Args:         cobra.NoArgs,
+		Args:         usageNoArgs,
 		SilenceUsage: true, // the Russian guidance below replaces the usage dump
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return runInit(derefString(configPath, "~/.config/wauploader/wauploader.toml"),
@@ -79,7 +79,7 @@ var (
 // for tests.
 func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY bool, out, errOut io.Writer) error {
 	if !stdinTTY || stdin == nil {
-		return nonTTYHint(cfgPath)
+		return exitUsage("%v", nonTTYHint(cfgPath))
 	}
 
 	var outTTY bool
@@ -122,6 +122,10 @@ func runInit(cfgPath string, jsonOut, noColor bool, stdin *os.File, stdinTTY boo
 	password = "" //nolint:ineffassign // deliberate zeroing of the plaintext reference before any reporting
 
 	if err != nil && !errors.Is(err, auth.ErrCookiesNotReturned) {
+		if errors.Is(err, auth.ErrLoginRefused) {
+			return exitAuth(err)
+		}
+
 		return err
 	}
 	// Keys without cookies are a usable state: save the keys and warn —

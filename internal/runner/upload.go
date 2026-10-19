@@ -69,7 +69,15 @@
 //     entry without a digest right after the PUT is ingest lag — retried
 //     up to verifyAttempts with short sleeps; a definite digest
 //     mismatch fails immediately. Verify failure = failed record; the
-//     next run re-uploads (idempotent overwrite) and re-verifies.
+//     next run re-uploads (idempotent overwrite) and re-verifies. A
+//     cancelled context is not a verify failure: like every other
+//     interrupt, it leaves the record queued (M-2 ruling).
+//   - Interrupts are resumable: every ctx-aware stage (skip-check,
+//     skip-guard, preflight, pacing gate, PUT, verify, derive baseline)
+//     treats ctx.Err() != nil as a stop — the record stays queued with
+//     its persisted digests and the next run's resume scan continues it
+//     (mirroring SaveRunner's semantics). Only a real stage failure is
+//     journaled failed.
 //   - Auth: ias3.ErrBadCredentials journals the file failed (unlike the
 //     save runner, which leaves its record queued — the brief pins the
 //     upload behavior), fires one Russian auth event, stops admitting
@@ -440,6 +448,10 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		if skipExisting { //nolint:nestif // skip-guard: md5 proof and tasks-busy checks nest by design
 			exists, err := r.cl.FileExistsMatchingMD5(ctx, f.t.Identifier, f.t.Key, f.rec.MD5)
 			if err != nil {
+				if ctx.Err() != nil {
+					return // cancelled; the record stays queued
+				}
+
 				r.failFile(events, c, f, "skip-check", err.Error())
 				continue
 			}
@@ -447,6 +459,10 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			if exists {
 				active, err := r.cl.HasActiveTasks(ctx, f.t.Identifier)
 				if err != nil {
+					if ctx.Err() != nil {
+						return // cancelled; the record stays queued
+					}
+
 					r.failFile(events, c, f, "skip-guard", fmt.Sprintf("не удалось проверить активные задачи item — пропуск недостоверен: %v", err))
 					continue
 				}
@@ -495,7 +511,12 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		if o.QueueDerive && !haveBaseline {
 			base, err := r.cl.NewestDeriveTaskID(ctx, it.identifier)
 			if err != nil {
+				if ctx.Err() != nil {
+					return // cancelled; the record stays queued
+				}
+
 				r.failFile(events, c, f, "derive-baseline", err.Error())
+
 				return
 			}
 
@@ -537,6 +558,13 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 			MD5Hex:     f.rec.MD5,
 		}
 		if err := r.cl.Upload(ctx, req, opt, progress); err != nil {
+			if ctx.Err() != nil {
+				// Cancelled mid-PUT: an interrupt, not a failure — the
+				// digests are persisted, the record stays queued and the
+				// next run restarts the file from byte 0.
+				return
+			}
+
 			if errors.Is(err, ias3.ErrBadCredentials) {
 				r.failFile(events, c, f, "auth", err.Error())
 				r.authPause(events, paused, authOnce, authErr, err)
@@ -560,6 +588,13 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 		// Stage 5: verify the remote copy by MD5.
 		if verify {
 			if err := r.verifyUpload(ctx, f.t, f.rec.MD5); err != nil {
+				if ctx.Err() != nil {
+					// Cancelled during verify (M-2 ruling): the PUT
+					// succeeded, so this is an interrupt — the record
+					// stays queued and the next run re-verifies it.
+					return
+				}
+
 				r.failFile(events, c, f, "verify", err.Error())
 				continue
 			}
