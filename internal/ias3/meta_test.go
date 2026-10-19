@@ -1,8 +1,8 @@
 package ias3
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -262,7 +262,7 @@ func TestWaitDeriveTimeout(t *testing.T) {
 	cl, ts := newTestClient(t, h)
 	cl.webBase = ts.URL
 
-	err := WaitDerive(context.Background(), cl, "testid1", time.Time{}, 2*time.Millisecond, 40*time.Millisecond)
+	err := WaitDerive(context.Background(), cl, "testid1", 0, 2*time.Millisecond, 40*time.Millisecond)
 	require.Error(t, err, "a derive that never finishes must end in a timeout error")
 	assert.Contains(t, err.Error(), "время", "the timeout error must be Russian and name the wait")
 	assert.Contains(t, err.Error(), "testid1", "the timeout error must name the item")
@@ -282,7 +282,7 @@ func TestWaitDeriveSuccessAfterPolling(t *testing.T) {
 	cl, ts := newTestClient(t, h)
 	cl.webBase = ts.URL
 
-	err := WaitDerive(context.Background(), cl, "testid1", time.Time{}, time.Millisecond, 5*time.Second)
+	err := WaitDerive(context.Background(), cl, "testid1", 0, time.Millisecond, 5*time.Second)
 	require.NoError(t, err, "queued→queued→done must end in success")
 	assert.GreaterOrEqual(t, calls, 3, "every non-terminal poll must precede the done answer")
 }
@@ -298,51 +298,47 @@ func TestWaitDeriveErrorTerminal(t *testing.T) {
 	cl, ts := newTestClient(t, h)
 	cl.webBase = ts.URL
 
-	err := WaitDerive(context.Background(), cl, "testid1", time.Time{}, time.Millisecond, 5*time.Second)
+	err := WaitDerive(context.Background(), cl, "testid1", 0, time.Millisecond, 5*time.Second)
 	require.Error(t, err)
 	assert.Equal(t, 1, calls, "a derive error is terminal — no further polling")
 	assert.Contains(t, err.Error(), "103", "the error must include the derive task_id when present")
 	assert.Contains(t, err.Error(), "ошибкой", "the error must be Russian")
 }
 
-// --- Fix round 1: submittime filtering + newest-catalog selection -----------
+// --- Fix round 2: baseline task_id derives contract + wait budget ----------
 //
-// Controller ruling amending plan §Task 8's done criterion: "left catalog +
-// present in history = done" holds only within a submission-time cutoff —
-// a prior batch's derive must never be observed as this batch's result
-// (r2 §6.2 documents the submittime criteria).
+// Supersedes round 1's notBefore approach (controller ruling on CodeRabbit
+// PR#11 findings): the caller captures the largest pre-upload derive
+// task_id (baseline) via NewestDeriveTaskID just before the PUT; a history
+// derive counts as done only when its task_id is NEWER than the baseline;
+// ANY catalog task (including non-derive archive.php) means pending and
+// never falls through to history.
 
-// TestDeriveStatusStaleHistoryIgnored: the fixture carries a done derive
-// from 2020; with notBefore=now it predates the cutoff and must NOT fake a
-// done — the state stays None (the caller keeps polling).
-func TestDeriveStatusStaleHistoryIgnored(t *testing.T) {
+// TestDeriveStatusBaselineBlocksStaleHistory: the fixture's done derive has
+// task_id 99; with baseline 99 (captured pre-PUT) the history entry is NOT
+// newer → pending, never a faked done.
+func TestDeriveStatusBaselineBlocksStaleHistory(t *testing.T) {
 	cl := newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil, nil))
 
-	st, err := cl.DeriveStatusSince(context.Background(), "testid1", time.Now())
+	st, err := cl.DeriveStatusSince(context.Background(), "testid1", 99)
 	require.NoError(t, err)
-	assert.Equal(t, DeriveNone, st, "a derive submitted before the cutoff must not count as done")
+	assert.Equal(t, DeriveNone, st, "a history derive not newer than the baseline belongs to a prior batch")
 }
 
-// TestDeriveStatusRecentHistoryDone: same envelope shape, but the history
-// derive's submittime is rendered at runtime (now) and the cutoff sits an
-// hour in the past → done.
-func TestDeriveStatusRecentHistoryDone(t *testing.T) {
-	nowStr := time.Now().UTC().Format("2006-01-02 15:04:05")
-	raw := bytes.ReplaceAll(readMetaFixture(t, "tasks_done_recent.json"),
-		[]byte("SUBMITTIME_PLACEHOLDER"), []byte(nowStr))
-	cl := newWebTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(raw)
-	}))
+// TestDeriveStatusFreshBaselineHistoryDone: zero baseline (fresh item / no
+// prior derives) → any history derive is this batch's result → done.
+func TestDeriveStatusFreshBaselineHistoryDone(t *testing.T) {
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil, nil))
 
-	st, err := cl.DeriveStatusSince(context.Background(), "testid1", time.Now().Add(-time.Hour))
+	st, err := cl.DeriveStatusSince(context.Background(), "testid1", 0)
 	require.NoError(t, err)
-	assert.Equal(t, DeriveDone, st, "a derive submitted after the cutoff is the done answer")
+	assert.Equal(t, DeriveDone, st, "with no prior derives the history derive is the current batch's done")
 }
 
-// TestWaitDeriveStaleHistoryTimesOut proves the not-done loop end-to-end:
-// with a stale done derive in history and notBefore=now, WaitDerive must
-// keep polling into the timeout — not return success on poll #1.
-func TestWaitDeriveStaleHistoryTimesOut(t *testing.T) {
+// TestWaitDeriveBaselineBlocksStaleHistory proves the baseline loop
+// end-to-end: baseline equal to the history derive's id keeps WaitDerive
+// polling into the timeout — no success on poll #1.
+func TestWaitDeriveBaselineBlocksStaleHistory(t *testing.T) {
 	calls := 0
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -351,27 +347,26 @@ func TestWaitDeriveStaleHistoryTimesOut(t *testing.T) {
 	cl, ts := newTestClient(t, h)
 	cl.webBase = ts.URL
 
-	err := WaitDerive(context.Background(), cl, "testid1", time.Now(), time.Millisecond, 25*time.Millisecond)
-	require.Error(t, err, "stale history must keep the caller waiting, never fake success")
+	err := WaitDerive(context.Background(), cl, "testid1", 99, time.Millisecond, 25*time.Millisecond)
+	require.Error(t, err, "a non-newer history derive must keep the caller waiting, never fake success")
 	assert.Contains(t, err.Error(), "время", "the wait must end in the Russian timeout error")
 	assert.Greater(t, calls, 1, "the stale-done answer must not terminate the loop")
 }
 
-// TestDeriveStatusStaleCatalogIgnored: catalog entries submitted before the
-// cutoff belong to earlier batches and are filtered like history ones —
-// with a far-future cutoff both fixture tasks vanish → None.
-func TestDeriveStatusStaleCatalogIgnored(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil, nil))
+// TestDeriveStatusAnyCatalogTaskBlocksHistory: a running archive.php (the
+// PUT's own ingest task) fills the catalog — the observation must stay
+// pending and NEVER fall through to the done derive sitting in history.
+func TestDeriveStatusAnyCatalogTaskBlocksHistory(t *testing.T) {
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil, nil))
 
-	st, err := cl.DeriveStatusSince(context.Background(), "testid1",
-		time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	st, err := cl.DeriveStatusSince(context.Background(), "testid1", 0)
 	require.NoError(t, err)
-	assert.Equal(t, DeriveNone, st, "stale catalog tasks must not define the state")
+	assert.Equal(t, DeriveNone, st, "non-empty catalog means pending even with a done derive in history — archive.php ingest runs before the derive")
 }
 
 // TestDeriveStatusNewestCatalogWins: tasks serialize per item, so the
 // newest catalog derive is the live one — an older errored task must not
-// mask the queued successor (controller finding 2).
+// mask the queued successor (controller finding 2, round 1 — retained).
 func TestDeriveStatusNewestCatalogWins(t *testing.T) {
 	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil, nil))
 
@@ -390,34 +385,76 @@ func TestDeriveStatusErrorWhenNewestErrored(t *testing.T) {
 	assert.Equal(t, DeriveError, st, "newest catalog task (201) is the errored one → error")
 }
 
-// TestDeriveStatusUnparseableSubmittime: tolerance and fail-safe direction —
-// with a cutoff, a task whose submittime proves nothing is filtered (keep
-// polling); without a cutoff the old presence behavior stands.
-func TestDeriveStatusUnparseableSubmittime(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_badtime.json", nil, nil))
-
-	st, err := cl.DeriveStatusSince(context.Background(), "testid1", time.Now())
+// TestNewestDeriveTaskID: 0 on a task-less item; the largest derive
+// task_id across catalog and history otherwise; non-derive tasks (the
+// ingest archive.php) are ignored even when their id is larger.
+func TestNewestDeriveTaskID(t *testing.T) {
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_none.json", nil, nil))
+	id, err := cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.NoError(t, err)
-	assert.Equal(t, DeriveNone, st, "unparseable submittime cannot prove the task is current")
+	assert.Equal(t, int64(0), id, "no derives at all → baseline 0")
 
-	st, err = cl.DeriveStatus(context.Background(), "testid1")
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil, nil))
+	id, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.NoError(t, err)
-	assert.Equal(t, DeriveRunning, st, "zero cutoff keeps the old presence behavior")
+	assert.Equal(t, int64(200), id, "newest across catalog+history (200 > 100)")
+
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil, nil))
+	id, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(99), id, "history derives count toward the baseline")
+
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil, nil))
+	id, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), id, "only derive tasks count: archive.php id 60 is ignored, derive 50 wins")
+
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil, nil))
+	_, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
+	require.Error(t, err, "a failed envelope must surface as an error, never a silent baseline 0")
+}
+
+// TestWaitDeriveBudgetBoundsInFlight: the timeout must bound in-flight
+// requests too — with the budget shorter than one poll interval the wait
+// ends promptly, far before a full poll cycle would elapse.
+func TestWaitDeriveBudgetBoundsInFlight(t *testing.T) {
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_running.json", nil, nil))
+
+	start := time.Now()
+	err := WaitDerive(context.Background(), cl, "testid1", 0, 200*time.Millisecond, 30*time.Millisecond)
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "время", "budget exhaustion must be the Russian timeout error")
+	assert.Less(t, elapsed, 150*time.Millisecond,
+		"the wait must end on the budget (30ms), not after a full 200ms poll cycle")
+}
+
+// TestWaitDeriveParentCancel: a cancelled parent context ends the wait as
+// an interruption (Ctrl-C semantics), distinct from budget exhaustion.
+func TestWaitDeriveParentCancel(t *testing.T) {
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_running.json", nil, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(5*time.Millisecond, cancel)
+
+	err := WaitDerive(ctx, cl, "testid1", 0, 50*time.Millisecond, 5*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "прервано", "a parent cancellation must read as an interruption")
+	assert.True(t, errors.Is(err, context.Canceled), "context.Canceled must survive the wrap, got: %v", err)
 }
 
 // TestWaitDeriveTimeoutGuard: symmetric fail-fast guards for non-positive
-// timeout and poll (controller finding 3); no request may leave.
+// timeout and poll (round-1 finding 3 — retained); no request may leave.
 func TestWaitDeriveTimeoutGuard(t *testing.T) {
 	cl, ts := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("no request may be sent when the arguments are invalid")
 	}))
 	cl.webBase = ts.URL
 
-	err := WaitDerive(context.Background(), cl, "testid1", time.Time{}, time.Millisecond, 0)
+	err := WaitDerive(context.Background(), cl, "testid1", 0, time.Millisecond, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "время", "the timeout guard must be Russian like the poll guard")
 
-	err = WaitDerive(context.Background(), cl, "testid1", time.Time{}, 0, time.Second)
+	err = WaitDerive(context.Background(), cl, "testid1", 0, 0, time.Second)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "интервал опроса", "the poll guard must stand")
 }

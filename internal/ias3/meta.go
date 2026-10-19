@@ -10,13 +10,15 @@
 //     keys (Authorization: LOW) per the keys-everywhere ruling (§7).
 //   - Tasks API: GET <webBase>/services/tasks.php?identifier=<id>&catalog=1
 //     &history=1 — S3 keys REQUIRED, cookies REJECTED (§6.1). Run states
-//     wait_admin: 0=queued 1=running 2=error 9=paused; a derive counts as
-//     done when it has left catalog and appears in history SUBMITTED at or
-//     after the caller's notBefore cutoff (r2 §6.2 submittime criteria —
-//     the cutoff scopes the observation to the current batch, so a prior
-//     batch's derive can never fake a result). Among catalog derives the
-//     NEWEST by task_id defines the state: tasks serialize per item, the
-//     newest is the live one.
+//     wait_admin: 0=queued 1=running 2=error 9=paused. The post-upload
+//     observation is scoped by a task_id BASELINE (controller ruling on
+//     CodeRabbit PR#11, superseding the round-1 submittime approach): the
+//     caller captures the largest pre-upload derive task_id via
+//     NewestDeriveTaskID just before the PUT; a history derive counts as
+//     done only when its task_id is NEWER than the baseline, and ANY
+//     catalog task — including the non-derive archive.php ingest — means
+//     pending and never falls through to history. Among catalog derives
+//     the NEWEST by task_id defines the state (tasks serialize per item).
 package ias3
 
 import (
@@ -197,7 +199,8 @@ const (
 	DeriveError
 	// DerivePaused — catalog: wait_admin 9 (held by IA staff).
 	DerivePaused
-	// DeriveDone — left catalog, present in history (§6.2).
+	// DeriveDone — left catalog, present in history with a task_id newer
+	// than the caller's baseline (§6.2 + the baseline contract).
 	DeriveDone
 )
 
@@ -223,47 +226,26 @@ func (s DeriveState) String() string {
 
 // tasksTask is one task object of a tasks.php listing; only the fields
 // Wauploader consumes are mapped. task_id is json.Number so a number or a
-// numeric string both print verbatim in diagnostics; submittime keeps its
-// raw wire text ("YYYY-MM-DD HH:MM:SS" per the API, r2 §6.2) and is parsed
-// tolerantly only where a cutoff demands it.
+// numeric string both print verbatim in diagnostics and compare
+// numerically for the baseline contract.
 type tasksTask struct {
-	TaskID     json.Number `json:"task_id"`
-	Cmd        string      `json:"cmd"`
-	WaitAdmin  int         `json:"wait_admin"`
-	SubmitTime string      `json:"submittime"`
+	TaskID    json.Number `json:"task_id"`
+	Cmd       string      `json:"cmd"`
+	WaitAdmin int         `json:"wait_admin"`
 }
 
-// submittimeLayouts are the accepted submittime spellings: the Tasks API's
-// "YYYY-MM-DD HH:MM:SS" (UTC) first, RFC3339 as tolerance for zone-stamped
-// variants.
-var submittimeLayouts = []string{"2006-01-02 15:04:05", time.RFC3339}
-
-// parseSubmittime decodes a tasks.php submittime value; ok is false when
-// the value proves nothing about WHEN the task was submitted.
-func parseSubmittime(s string) (time.Time, bool) {
-	s = strings.TrimSpace(s)
-	for _, layout := range submittimeLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t, true
-		}
-	}
-	return time.Time{}, false
+// tasksListing mirrors the tasks.php response envelope (r2 §6.1) with the
+// per-category task arrays of a catalog+history listing.
+type tasksListing struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error"`
+	Value   struct {
+		Catalog []tasksTask `json:"catalog"`
+		History []tasksTask `json:"history"`
+	} `json:"value"`
 }
 
-// taskIsCurrent reports whether a task counts toward the observation. A
-// zero notBefore keeps the pure presence behavior (every task counts). A
-// real cutoff admits only tasks submitted at or after it; an unparseable
-// submittime proves nothing and is filtered — fail-safe: the caller keeps
-// polling instead of acting on a possibly-stale task.
-func taskIsCurrent(t tasksTask, notBefore time.Time) bool {
-	if notBefore.IsZero() {
-		return true
-	}
-	st, ok := parseSubmittime(t.SubmitTime)
-	return ok && !st.Before(notBefore)
-}
-
-// taskIDInt64 is a best-effort numeric view of a task_id for
+// taskIDInt64 is a numeric view of a task_id for baseline comparison and
 // newest-first selection; an unparseable id ranks as 0 (still selectable
 // when it is the only candidate).
 func taskIDInt64(t tasksTask) int64 {
@@ -275,31 +257,60 @@ func taskIDInt64(t tasksTask) int64 {
 
 // DeriveStatus maps the item's derive job onto a DeriveState in one
 // tasks.php listing call (GET ?identifier=<id>&catalog=1&history=1&limit=…,
-// r2 §6.2) with no submission-time cutoff: every derive task counts,
-// whatever batch submitted it. The Tasks API accepts ONLY the S3-key LOW
-// header (cookies are rejected by design, §6.1); setAuth touches nothing
-// else.
+// r2 §6.2) with baseline 0 — the diagnostics view where every derive
+// counts, whatever batch submitted it. The Tasks API accepts ONLY the
+// S3-key LOW header (cookies are rejected by design, §6.1); setAuth
+// touches nothing else.
 func (c *Client) DeriveStatus(ctx context.Context, identifier string) (DeriveState, error) {
-	return c.DeriveStatusSince(ctx, identifier, time.Time{})
+	return c.DeriveStatusSince(ctx, identifier, 0)
 }
 
-// DeriveStatusSince is DeriveStatus scoped to the current batch: derive
-// tasks submitted BEFORE notBefore are ignored in both catalog and
-// history, so a prior batch's done or errored derive can never be
-// observed as this batch's result (controller amendment of the plan's
-// presence-only done criterion; r2 §6.2 submittime criteria). The zero
-// time.Time{} disables the cutoff. Callers pass the moment just before
-// their PUT.
-func (c *Client) DeriveStatusSince(ctx context.Context, identifier string, notBefore time.Time) (DeriveState, error) {
-	st, _, err := c.deriveStatusDetailed(ctx, identifier, notBefore)
+// DeriveStatusSince is DeriveStatus scoped to the current upload batch by
+// the task_id baseline: the largest derive task_id the item already had
+// BEFORE the PUT (capture it with NewestDeriveTaskID just before the
+// upload). Resolution: ANY catalog task — including the non-derive
+// archive.php ingest — means pending (the derive state comes from the
+// newest catalog derive; with no derive queued yet it is DeriveNone) and
+// history is never consulted while the catalog is non-empty; with an
+// empty catalog, a history derive counts as done only when its task_id is
+// NEWER than the baseline — an older one belongs to a prior batch. The
+// zero baseline (fresh item / no prior derives) admits any history derive.
+func (c *Client) DeriveStatusSince(ctx context.Context, identifier string, baselineTaskID int64) (DeriveState, error) {
+	st, _, err := c.deriveStatusDetailed(ctx, identifier, baselineTaskID)
 	return st, err
 }
 
-// deriveStatusDetailed is DeriveStatusSince plus the derive task_id for
-// diagnostics (WaitDerive's terminal error names it when present).
-func (c *Client) deriveStatusDetailed(ctx context.Context, identifier string, notBefore time.Time) (DeriveState, string, error) {
+// NewestDeriveTaskID returns the largest derive task_id currently visible
+// for the item across catalog and history — the baseline a caller
+// captures JUST BEFORE a PUT so that WaitDerive can afterwards recognize
+// only newer derives as this upload's result. Non-derive tasks (the
+// archive.php ingest) are ignored; 0 means the item has no derives at all
+// (fresh item).
+func (c *Client) NewestDeriveTaskID(ctx context.Context, identifier string) (int64, error) {
+	listing, err := c.fetchTaskListing(ctx, identifier)
+	if err != nil {
+		return 0, err
+	}
+	maxID := int64(0)
+	for _, t := range append(listing.Value.Catalog, listing.Value.History...) {
+		if t.Cmd != deriveCmd {
+			continue
+		}
+		if id := taskIDInt64(t); id > maxID {
+			maxID = id
+		}
+	}
+	return maxID, nil
+}
+
+// fetchTaskListing performs the one catalog+history listing call shared by
+// the derive observation and the baseline capture: identifier validation,
+// LOW-key auth (cookies rejected by this API), the full retry ladder, and
+// the envelope parse with its Russian failure surfaces.
+func (c *Client) fetchTaskListing(ctx context.Context, identifier string) (tasksListing, error) {
+	var payload tasksListing
 	if err := ValidateIdentifier(identifier); err != nil {
-		return DeriveNone, "", err
+		return payload, err
 	}
 	q := url.Values{}
 	q.Set("identifier", identifier)
@@ -309,60 +320,73 @@ func (c *Client) deriveStatusDetailed(ctx context.Context, identifier string, no
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.webBase+"/services/tasks.php?"+q.Encode(), nil)
 	if err != nil {
-		return DeriveNone, "", fmt.Errorf("опрос задач элемента %s: построить запрос: %w", identifier, sanitizeReqErr(err))
+		return payload, fmt.Errorf("опрос задач элемента %s: построить запрос: %w", identifier, sanitizeReqErr(err))
 	}
 	c.setAuth(req)
 	resp, err := c.hc.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryIdempotent})
 	if err != nil {
-		return DeriveNone, "", fmt.Errorf("опрос задач элемента %s не выполнен: %w", identifier, sanitizeReqErr(err))
+		return payload, fmt.Errorf("опрос задач элемента %s не выполнен: %w", identifier, sanitizeReqErr(err))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyRead))
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusOK {
-		return DeriveNone, "", fmt.Errorf("опрос задач элемента %s: неожиданный HTTP %d", identifier, resp.StatusCode)
+		return payload, fmt.Errorf("опрос задач элемента %s: неожиданный HTTP %d", identifier, resp.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 	if err != nil {
-		return DeriveNone, "", fmt.Errorf("опрос задач элемента %s: чтение ответа: %w", identifier, err)
-	}
-	var payload struct {
-		Success bool   `json:"success"`
-		Error   string `json:"error"`
-		Value   struct {
-			Catalog []tasksTask `json:"catalog"`
-			History []tasksTask `json:"history"`
-		} `json:"value"`
+		return payload, fmt.Errorf("опрос задач элемента %s: чтение ответа: %w", identifier, err)
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return DeriveNone, "", fmt.Errorf("опрос задач элемента %s: ответ не разобран: %w", identifier, err)
+		return payload, fmt.Errorf("опрос задач элемента %s: ответ не разобран: %w", identifier, err)
 	}
 	if !payload.Success {
 		reason := strings.TrimSpace(payload.Error)
 		if reason == "" {
 			reason = "причина не указана"
 		}
-		return DeriveNone, "", fmt.Errorf("опрос задач элемента %s не выполнен, archive.org вернул ошибку: %s",
+		return payload, fmt.Errorf("опрос задач элемента %s не выполнен, archive.org вернул ошибку: %s",
 			identifier, truncateFragment(reason))
 	}
+	return payload, nil
+}
 
-	// Catalog first: an active derive defines the present state. Tasks
-	// serialize per item, so among the current-batch catalog derives the
-	// NEWEST by task_id is the live one — an older errored task must not
-	// mask its queued successor.
-	var newest tasksTask
-	var haveNewest bool
-	var newestID int64
-	for _, t := range payload.Value.Catalog {
-		if t.Cmd != deriveCmd || !taskIsCurrent(t, notBefore) {
-			continue
-		}
-		if id := taskIDInt64(t); !haveNewest || id > newestID {
-			newest, haveNewest, newestID = t, true, id
-		}
+// deriveStatusDetailed is DeriveStatusSince plus the derive task_id for
+// diagnostics (WaitDerive's terminal error names it when present). The
+// resolution order encodes the wire reality that tasks serialize per item
+// and a PUT's own ingest (archive.php) runs before the derive queues:
+//
+//  1. catalog non-empty → pending, never history (state from the newest
+//     catalog derive, or DeriveNone while only ingest work is visible);
+//  2. catalog empty → newest history derive with task_id > baseline → done;
+//  3. otherwise → DeriveNone.
+func (c *Client) deriveStatusDetailed(ctx context.Context, identifier string, baselineTaskID int64) (DeriveState, string, error) {
+	payload, err := c.fetchTaskListing(ctx, identifier)
+	if err != nil {
+		return DeriveNone, "", err
 	}
-	if haveNewest {
+
+	// Catalog first: ANY task means the item is busy — the observation
+	// stays non-terminal and must never fall through to history while
+	// work is in flight.
+	if len(payload.Value.Catalog) > 0 {
+		var newest tasksTask
+		var haveNewest bool
+		var newestID int64
+		for _, t := range payload.Value.Catalog {
+			if t.Cmd != deriveCmd {
+				continue
+			}
+			if id := taskIDInt64(t); !haveNewest || id > newestID {
+				newest, haveNewest, newestID = t, true, id
+			}
+		}
+		if !haveNewest {
+			// Busy with other work (e.g. the PUT's own ingest); the
+			// derive has not queued yet — keep the caller waiting.
+			return DeriveNone, "", nil
+		}
 		switch newest.WaitAdmin {
 		case 0:
 			return DeriveQueued, newest.TaskID.String(), nil
@@ -379,39 +403,67 @@ func (c *Client) deriveStatusDetailed(ctx context.Context, identifier string, no
 			return DeriveRunning, newest.TaskID.String(), nil
 		}
 	}
-	// Done: the derive left catalog and shows in history, submitted
-	// within the observed batch (§6.2 + the notBefore cutoff). While any
-	// current-batch derive is active the catalog branch above takes
-	// precedence.
+
+	// Catalog empty: done means a derive NEWER than the pre-PUT baseline
+	// finished into history — an older one belongs to a prior batch.
+	var done tasksTask
+	var haveDone bool
+	var doneID int64
 	for _, t := range payload.Value.History {
-		if t.Cmd == deriveCmd && taskIsCurrent(t, notBefore) {
-			return DeriveDone, t.TaskID.String(), nil
+		if t.Cmd != deriveCmd {
+			continue
 		}
+		if id := taskIDInt64(t); id > baselineTaskID && (!haveDone || id > doneID) {
+			done, haveDone, doneID = t, true, id
+		}
+	}
+	if haveDone {
+		return DeriveDone, done.TaskID.String(), nil
 	}
 	return DeriveNone, "", nil
 }
 
 // WaitDerive polls DeriveStatusSince every poll until the derive is done,
-// the context ends, or timeout elapses. The notBefore cutoff (same
-// semantics as DeriveStatusSince; pass the moment just before the PUT)
-// keeps prior-batch derives from ending the wait. DeriveError is terminal
-// immediately and its Russian error names the derive task_id when the API
-// supplied one (the item history page is the diagnostic surface).
-// DeriveNone keeps polling: a freshly PUT item's derive only becomes
-// visible after ingest. poll and timeout must be positive — invalid values
-// fail fast in Russian before any request.
-func WaitDerive(ctx context.Context, c *Client, identifier string, notBefore time.Time, poll, timeout time.Duration) error {
+// the context ends, or the wait budget (timeout) is spent. The baseline
+// task_id (same semantics as DeriveStatusSince; capture it with
+// NewestDeriveTaskID just before the PUT) keeps prior-batch derives from
+// ending the wait. DeriveError is terminal immediately and its Russian
+// error names the derive task_id when the API supplied one (the item
+// history page is the diagnostic surface). DeriveNone keeps polling: a
+// freshly PUT item's derive only becomes visible after its ingest task
+// finishes. poll and timeout must be positive — invalid values fail fast
+// in Russian before any request.
+//
+// The budget is a real context: every poll runs under it, so an in-flight
+// request is cut off when the budget expires (the wait never overshoots
+// by a full poll cycle), and a cancelled parent reads as an interruption,
+// distinct from budget exhaustion.
+func WaitDerive(ctx context.Context, c *Client, identifier string, baselineTaskID int64, poll, timeout time.Duration) error {
 	if poll <= 0 {
 		return errors.New("ожидание деривации: интервал опроса должен быть положительным")
 	}
 	if timeout <= 0 {
 		return errors.New("ожидание деривации: время ожидания должно быть положительным")
 	}
-	deadline := time.Now().Add(timeout)
+	wctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	budgetErr := func() error {
+		return fmt.Errorf("деривация элемента «%s» не завершилась за отведённое время ожидания", identifier)
+	}
+	interruptedErr := func() error {
+		return fmt.Errorf("ожидание деривации элемента «%s» прервано: %w", identifier, ctx.Err())
+	}
 	for {
-		st, taskID, err := c.deriveStatusDetailed(ctx, identifier, notBefore)
+		st, taskID, err := c.deriveStatusDetailed(wctx, identifier, baselineTaskID)
 		if err != nil {
-			return err
+			switch {
+			case ctx.Err() != nil:
+				return interruptedErr()
+			case errors.Is(err, context.DeadlineExceeded):
+				return budgetErr()
+			default:
+				return err
+			}
 		}
 		switch st {
 		case DeriveDone:
@@ -423,11 +475,11 @@ func WaitDerive(ctx context.Context, c *Client, identifier string, notBefore tim
 			}
 			return fmt.Errorf("деривация элемента «%s» завершилась ошибкой: подробности на странице истории элемента", identifier)
 		}
-		if !sleepCtx(ctx, poll) {
-			return fmt.Errorf("ожидание деривации элемента «%s» прервано: %w", identifier, ctx.Err())
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("деривация элемента «%s» не завершилась за отведённое время ожидания", identifier)
+		if !sleepCtx(wctx, poll) {
+			if ctx.Err() != nil {
+				return interruptedErr()
+			}
+			return budgetErr()
 		}
 	}
 }
