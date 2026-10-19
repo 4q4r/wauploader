@@ -231,11 +231,14 @@ func ParseIATimedelta(s string) (time.Duration, error) {
 	overLimit := func() error {
 		return fmt.Errorf("недопустимое значение длительности %q: значение превышает предел 100 лет (%s)", s, usage)
 	}
-	if seconds, err := strconv.Atoi(trimmed); err == nil {
+	// Parse at explicit 64-bit width: platform int would reject values that
+	// are legal on 32-bit builds even though they sit below the cap.
+	seconds, err := strconv.ParseInt(trimmed, 10, 64)
+	if err == nil {
 		switch {
 		case seconds < 0:
 			return 0, badFormat()
-		case int64(seconds) > maxIATimedeltaSeconds:
+		case seconds > maxIATimedeltaSeconds:
 			return 0, overLimit()
 		}
 		return time.Duration(seconds) * time.Second, nil
@@ -258,15 +261,15 @@ func ParseIATimedelta(s string) (time.Duration, error) {
 		default:
 			return 0, badFormat()
 		}
-		value, err := strconv.Atoi(token[:len(token)-1])
+		value, err := strconv.ParseInt(token[:len(token)-1], 10, 64)
 		if err != nil || value < 0 {
 			return 0, badFormat()
 		}
 		// Division-first bound check: proves the multiply cannot overflow.
-		if int64(value) > maxIATimedeltaSeconds/unitSeconds {
+		if value > maxIATimedeltaSeconds/unitSeconds {
 			return 0, overLimit()
 		}
-		total += int64(value) * unitSeconds
+		total += value * unitSeconds
 		if total > maxIATimedeltaSeconds {
 			return 0, overLimit()
 		}

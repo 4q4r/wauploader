@@ -220,6 +220,7 @@ func TestParseIATimedeltaForms(t *testing.T) {
 		want  time.Duration
 	}{
 		{"120", 120 * time.Second},
+		{"2147483648", 2147483648 * time.Second},
 		{"3d 5h 20m", 3*24*time.Hour + 5*time.Hour + 20*time.Minute},
 		{"1d", 24 * time.Hour},
 		{"45s", 45 * time.Second},
