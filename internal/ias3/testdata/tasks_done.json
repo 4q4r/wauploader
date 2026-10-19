@@ -4,8 +4,8 @@
     "summary": {"queued": 0, "running": 0, "error": 0, "paused": 0},
     "catalog": [],
     "history": [
-      {"task_id": 99, "cmd": "derive.php", "wait_admin": 0, "finished": "2026-10-19 12:00:00"},
-      {"task_id": 42, "cmd": "archive.php", "wait_admin": 0}
+      {"task_id": 99, "cmd": "derive.php", "wait_admin": 0, "submittime": "2020-01-01 00:00:00", "finished": "2020-01-01 02:00:00"},
+      {"task_id": 42, "cmd": "archive.php", "wait_admin": 0, "submittime": "2020-01-01 00:00:00"}
     ]
   }
 }

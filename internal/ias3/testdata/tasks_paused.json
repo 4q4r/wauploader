@@ -3,7 +3,7 @@
   "value": {
     "summary": {"queued": 0, "running": 0, "error": 0, "paused": 1},
     "catalog": [
-      {"task_id": 104, "cmd": "derive.php", "wait_admin": 9, "submitter": "uploader@example.com", "priority": 0}
+      {"task_id": 104, "cmd": "derive.php", "wait_admin": 9, "submittime": "2026-10-19 11:00:00", "submitter": "uploader@example.com", "priority": 0}
     ],
     "history": []
   }
