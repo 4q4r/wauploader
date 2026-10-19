@@ -126,10 +126,18 @@ func TestValidateMediatypeEnum(t *testing.T) {
 }
 
 func TestValidateKeysPaired(t *testing.T) {
+	// Upload-side fields are satisfied so the pairing rule is the only thing
+	// that can fail here — the assertion must not depend on rule ordering.
 	onlyAccess := Default()
+	onlyAccess.Upload.Collection = "test-collection"
+	onlyAccess.Upload.Mediatype = "data"
 	onlyAccess.Auth.S3Access = "AKIAEXAMPLE"
-	if err := onlyAccess.Validate(ModeUpload); err == nil {
-		t.Error("s3_access without s3_secret = nil, want error")
+	err := onlyAccess.Validate(ModeUpload)
+	if err == nil {
+		t.Fatal("s3_access without s3_secret = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "s3_access") {
+		t.Errorf("error %q must be the key-pairing error naming s3_access", err)
 	}
 
 	onlySecret := Default()
@@ -193,6 +201,13 @@ func TestLoadParseErrorHasPosition(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "не удалось разобрать") {
 		t.Errorf("error %q must carry the Russian parse-failure prefix", err)
+	}
+	// The user-visible message itself must carry the position, not only the
+	// wrapped DecodeError internals.
+	for _, want := range []string{"строка", fmt.Sprintf("строка %d", row), fmt.Sprintf("столбец %d", column)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must contain %q", err, want)
+		}
 	}
 	if decodeErr.String() == "" {
 		t.Error("DecodeError.String() contextualized view must not be empty")

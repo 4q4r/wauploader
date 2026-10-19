@@ -165,7 +165,9 @@ func Load(path string) (*Config, error) {
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		var decodeErr *toml.DecodeError
 		if errors.As(err, &decodeErr) {
-			return nil, fmt.Errorf("не удалось разобрать файл конфигурации %s:\n%w", path, decodeErr)
+			row, col := decodeErr.Position()
+			return nil, fmt.Errorf("не удалось разобрать файл конфигурации %s (строка %d, столбец %d): %w\n%s",
+				path, row, col, decodeErr, decodeErr.String())
 		}
 		return nil, fmt.Errorf("не удалось разобрать файл конфигурации %s: %w", path, err)
 	}
