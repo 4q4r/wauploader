@@ -2,9 +2,11 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -233,6 +235,169 @@ func TestParseIATimedeltaForms(t *testing.T) {
 
 	if got, err := ParseIATimedelta(""); got != 0 || err == nil {
 		t.Errorf("ParseIATimedelta(\"\") = (%v, %v), want (0, error)", got, err)
+	}
+}
+
+func TestDetectUnknownKeysReportsUnknownSection(t *testing.T) {
+	path := writeTempConfig(t, "[spam2]\nfoo = true\n")
+	unknown, err := DetectUnknownKeys(path)
+	if err != nil {
+		t.Fatalf("DetectUnknownKeys: %v", err)
+	}
+	found := false
+	for _, key := range unknown {
+		if key == "spam2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("unknown keys %v must contain the unknown section \"spam2\"", unknown)
+	}
+}
+
+// TestKnownSectionsCoversEveryStructKey guards against drift between the
+// struct TOML tags and the hand-maintained knownSections table: the two must
+// name exactly the same sections and keys, every struct field must carry an
+// explicit tag, and a generated document holding every known key must load
+// cleanly (Load succeeds, DetectUnknownKeys silent, every value round-trips).
+func TestKnownSectionsCoversEveryStructKey(t *testing.T) {
+	sectionTypes := map[string]reflect.Type{
+		"auth":    reflect.TypeOf(AuthConfig{}),
+		"spn2":    reflect.TypeOf(SPN2Config{}),
+		"upload":  reflect.TypeOf(UploadConfig{}),
+		"limits":  reflect.TypeOf(LimitsConfig{}),
+		"console": reflect.TypeOf(ConsoleConfig{}),
+	}
+	if len(sectionTypes) != len(knownSections) {
+		t.Fatalf("section count drift: %d struct sections vs %d knownSections entries",
+			len(sectionTypes), len(knownSections))
+	}
+	for name, typ := range sectionTypes {
+		known, ok := knownSections[name]
+		if !ok {
+			t.Errorf("struct section %q missing from knownSections", name)
+			continue
+		}
+		tags := map[string]bool{}
+		for i := 0; i < typ.NumField(); i++ {
+			tag := typ.Field(i).Tag.Get("toml")
+			if tag == "" {
+				t.Errorf("section %q field %s has no toml tag", name, typ.Field(i).Name)
+				continue
+			}
+			tags[tag] = true
+		}
+		for tag := range tags {
+			if !known[tag] {
+				t.Errorf("struct tag %q (section %s) missing from knownSections", tag, name)
+			}
+		}
+		for key := range known {
+			if !tags[key] {
+				t.Errorf("knownSections key %q (section %s) has no matching struct tag", key, name)
+			}
+		}
+	}
+
+	placeholder := func(typ reflect.Type, key string) string {
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			if field.Tag.Get("toml") != key {
+				continue
+			}
+			switch field.Type.Kind() {
+			case reflect.Bool:
+				return "true"
+			case reflect.Int:
+				return "1"
+			default:
+				return `"example-` + key + `"`
+			}
+		}
+		return ""
+	}
+	var doc strings.Builder
+	for _, name := range []string{"auth", "spn2", "upload", "limits", "console"} {
+		fmt.Fprintf(&doc, "[%s]\n", name)
+		keys := make([]string, 0, len(knownSections[name]))
+		for key := range knownSections[name] {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			fmt.Fprintf(&doc, "%s = %s\n", key, placeholder(sectionTypes[name], key))
+		}
+	}
+
+	path := writeTempConfig(t, doc.String())
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load of the all-keys document failed: %v", err)
+	}
+	unknown, err := DetectUnknownKeys(path)
+	if err != nil {
+		t.Fatalf("DetectUnknownKeys: %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Errorf("DetectUnknownKeys on the all-keys document = %v, want empty", unknown)
+	}
+
+	// Every key must round-trip into the field its struct tag names, proving
+	// go-toml maps the lowercase section/key names used by knownSections.
+	cfgValue := reflect.ValueOf(cfg).Elem()
+	sectionIndex := map[string]int{}
+	for i := 0; i < cfgValue.NumField(); i++ {
+		sectionIndex[strings.ToLower(cfgValue.Type().Field(i).Name)] = i
+	}
+	for name, typ := range sectionTypes {
+		section := cfgValue.Field(sectionIndex[name])
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			key := field.Tag.Get("toml")
+			value := section.Field(i)
+			switch field.Type.Kind() {
+			case reflect.Bool:
+				if !value.Bool() {
+					t.Errorf("%s.%s did not round-trip: got false, want true", name, key)
+				}
+			case reflect.Int:
+				if value.Int() != 1 {
+					t.Errorf("%s.%s did not round-trip: got %d, want 1", name, key, value.Int())
+				}
+			default:
+				if want := "example-" + key; value.String() != want {
+					t.Errorf("%s.%s did not round-trip: got %q, want %q", name, key, value.String(), want)
+				}
+			}
+		}
+	}
+}
+
+func TestParseIATimedeltaRejectsOverflow(t *testing.T) {
+	for _, bad := range []string{"999999999d", "500000000h", "9999999999999999", "36000d 36000d"} {
+		got, err := ParseIATimedelta(bad)
+		if err == nil {
+			t.Errorf("ParseIATimedelta(%q) = %v, want error (absurd magnitudes must fail, not wrap)", bad, got)
+			continue
+		}
+		if got < 0 {
+			t.Errorf("ParseIATimedelta(%q) = %v, negative results leak the overflow", bad, got)
+		}
+	}
+}
+
+func TestParseIATimedeltaEdgeSemantics(t *testing.T) {
+	// "1d5h" without whitespace violates the space-separated grammar.
+	if got, err := ParseIATimedelta("1d5h"); err == nil {
+		t.Errorf("ParseIATimedelta(\"1d5h\") = %v, want error", got)
+	}
+	// "+120" is accepted: strconv.Atoi sign semantics, pinned here on purpose.
+	if got, err := ParseIATimedelta("+120"); err != nil || got != 120*time.Second {
+		t.Errorf("ParseIATimedelta(\"+120\") = (%v, %v), want (2m0s, nil)", got, err)
+	}
+	// Repeated units sum, pinned so Task 6 does not assume strictness.
+	if got, err := ParseIATimedelta("1d 2d"); err != nil || got != 72*time.Hour {
+		t.Errorf("ParseIATimedelta(\"1d 2d\") = (%v, %v), want (72h0m0s, nil)", got, err)
 	}
 }
 

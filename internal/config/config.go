@@ -209,44 +209,67 @@ func DetectUnknownKeys(path string) ([]string, error) {
 	return unknown, nil
 }
 
+// maxIATimedeltaSeconds caps every parsed duration at 100 years so absurd
+// magnitudes fail fast instead of silently overflowing time.Duration.
+const maxIATimedeltaSeconds int64 = 100 * 365 * 24 * 3600
+
 // ParseIATimedelta parses the Internet Archive timedelta form: a bare number
 // means seconds ("120"), otherwise whitespace-separated number+unit tokens
-// with units d, h, m, s ("3d 5h 20m").
+// with units d, h, m, s ("3d 5h 20m"). Repeated units sum ("1d 2d" = 72h) and
+// totals beyond 100 years are rejected.
 func ParseIATimedelta(s string) (time.Duration, error) {
 	const usage = `примеры допустимых форм "120" (секунды) и "3d 5h 20m" (единицы d, h, m, s)`
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
 		return 0, fmt.Errorf("пустое значение длительности: %s", usage)
 	}
+	badFormat := func() error {
+		return fmt.Errorf("недопустимое значение длительности %q: %s", s, usage)
+	}
+	overLimit := func() error {
+		return fmt.Errorf("недопустимое значение длительности %q: значение превышает предел 100 лет (%s)", s, usage)
+	}
 	if seconds, err := strconv.Atoi(trimmed); err == nil {
-		if seconds < 0 {
-			return 0, fmt.Errorf("недопустимое значение длительности %q: %s", s, usage)
+		switch {
+		case seconds < 0:
+			return 0, badFormat()
+		case int64(seconds) > maxIATimedeltaSeconds:
+			return 0, overLimit()
 		}
 		return time.Duration(seconds) * time.Second, nil
 	}
-	total := time.Duration(0)
+	var total int64
 	for _, token := range strings.Fields(trimmed) {
 		if len(token) < 2 {
-			return 0, fmt.Errorf("недопустимое значение длительности %q: %s", s, usage)
+			return 0, badFormat()
+		}
+		var unitSeconds int64
+		switch token[len(token)-1] {
+		case 'd':
+			unitSeconds = 86400
+		case 'h':
+			unitSeconds = 3600
+		case 'm':
+			unitSeconds = 60
+		case 's':
+			unitSeconds = 1
+		default:
+			return 0, badFormat()
 		}
 		value, err := strconv.Atoi(token[:len(token)-1])
 		if err != nil || value < 0 {
-			return 0, fmt.Errorf("недопустимое значение длительности %q: %s", s, usage)
+			return 0, badFormat()
 		}
-		switch token[len(token)-1] {
-		case 'd':
-			total += time.Duration(value) * 24 * time.Hour
-		case 'h':
-			total += time.Duration(value) * time.Hour
-		case 'm':
-			total += time.Duration(value) * time.Minute
-		case 's':
-			total += time.Duration(value) * time.Second
-		default:
-			return 0, fmt.Errorf("недопустимое значение длительности %q: %s", s, usage)
+		// Division-first bound check: proves the multiply cannot overflow.
+		if int64(value) > maxIATimedeltaSeconds/unitSeconds {
+			return 0, overLimit()
+		}
+		total += int64(value) * unitSeconds
+		if total > maxIATimedeltaSeconds {
+			return 0, overLimit()
 		}
 	}
-	return total, nil
+	return time.Duration(total) * time.Second, nil
 }
 
 // MergeFlag applies a flag-over-config mutation. Commands build a closure
