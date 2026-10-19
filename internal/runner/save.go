@@ -17,7 +17,9 @@
 //     charged (the record stays queued for the next run).
 //   - user-session-limit is special-cased before quota parking: the
 //     runner polls UserStatus and waits while processing >= available,
-//     then retries, because the session frees as in-flight jobs finish.
+//     then retries, because the session frees as in-flight jobs finish;
+//     the wait is expected behavior and does not consume the resubmit
+//     budget.
 //   - Job-state error documents from the status endpoint are classified
 //     runner-side: the quota family parks, everything else fails as
 //     terminal (the full wire taxonomy lives in spn2 for Submit
@@ -370,6 +372,11 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 		r.finishFailed(events, c, rec)
 		return true
 	}
+	if paused.Load() {
+		// An auth pause landed while this worker waited in the resubmit
+		// loop: stay queued instead of submitting behind a paused queue.
+		return true
+	}
 	// Global pacing gate for POST /save admissions (burst 1).
 	if err := r.gate.Wait(ctx); err != nil {
 		return true // cancelled while pacing; the record stays queued
@@ -382,6 +389,16 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 			r.authPause(events, paused, authOnce, authErr, err)
 			return true
 		}
+		if isSessionLimit(err) {
+			// Session-busy refusal: wait for the quota to free and
+			// resubmit. The wait is expected behavior, not a failed
+			// attempt, so no attempt is charged and the record stays
+			// queued throughout.
+			if !r.waitSession(ctx, rec, events, paused, authOnce, authErr) {
+				return true
+			}
+			return false
+		}
 		rec.Attempts++
 		rec.ErrKind = errKindName(err)
 		rec.ErrMsg = err.Error()
@@ -391,12 +408,6 @@ func (r *SaveRunner) submitStage(ctx context.Context, rec *journal.Record, opts 
 		}
 		switch classifySPN2(err) {
 		case spn2.KindQuota:
-			if isSessionLimit(err) {
-				if !r.waitSession(ctx, rec, events, paused, authOnce, authErr) {
-					return true
-				}
-				return false // session freed: retry the submit
-			}
 			rec.ErrKind = "quota"
 			rec.ErrMsg = parkMessage(err.Error())
 			r.park(events, c, rec)

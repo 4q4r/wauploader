@@ -53,6 +53,7 @@ type fakeSPN2 struct {
 	submitsByTarget map[string]int
 	submitTimes     []time.Time
 	pollsByJob      map[string]int
+	userPolls       int
 
 	submitFn func(target string, nth int) fakeResp
 	statusFn func(jobID string, nth int) fakeResp
@@ -124,11 +125,21 @@ func (f *fakeSPN2) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeSPN2) handleUser(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.userPolls++
+	f.mu.Unlock()
 	resp := fakeResp{code: http.StatusOK, body: `{"available":1,"processing":0}`}
 	if f.userFn != nil {
 		resp = f.userFn()
 	}
 	writeFake(w, resp)
+}
+
+// userCount reports how many times the session-quota probe was hit.
+func (f *fakeSPN2) userCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.userPolls
 }
 
 func (f *fakeSPN2) count(m map[string]int, k string) int {
@@ -527,6 +538,101 @@ func TestAuthFailurePausesQueue(t *testing.T) {
 	require.Equal(t, journal.StateDone, mustRecord(t, st, first).State)
 	require.Equal(t, journal.StateQueued, mustRecord(t, st, second).State)
 	require.Equal(t, journal.StateQueued, mustRecord(t, st, third).State)
+	require.Zero(t, mustRecord(t, st, second).Attempts, "an auth refusal must not charge the resubmit budget")
+	require.Zero(t, mustRecord(t, st, third).Attempts)
+}
+
+func TestSessionLimitWaitsForUserStatus(t *testing.T) {
+	f := newFakeSPN2(t)
+	f.statusFn = func(jobID string, nth int) fakeResp { return statusSuccess() }
+	userCalls := 0
+	f.userFn = func() fakeResp {
+		userCalls++
+		if userCalls == 1 {
+			return fakeResp{code: http.StatusOK, body: `{"available":0,"processing":1}`}
+		}
+		return fakeResp{code: http.StatusOK, body: `{"available":1,"processing":0}`}
+	}
+	f.submitFn = func(target string, nth int) fakeResp {
+		if nth == 1 {
+			return fakeResp{code: http.StatusOK, body: `{"status":"error","status_ext":"error:user-session-limit","message":"session busy"}`}
+		}
+		return submitOK("job-sl")
+	}
+	r, st := newTestRunner(t, f, testLimits())
+
+	target := "https://example.com/"
+	_, sum, err := runAll(t, context.Background(), r, []string{target}, spn2.Options{}, false)
+	require.NoError(t, err)
+	require.Equal(t, Summary{Done: 1}, sum)
+
+	require.GreaterOrEqual(t, userCalls, 2, "the runner must poll UserStatus until the session frees")
+	require.Equal(t, 2, f.count(f.submitsByTarget, target), "the target must be resubmitted after the session frees")
+	require.Zero(t, mustRecord(t, st, target).Attempts, "session-limit waits must not charge the resubmit budget")
+}
+
+func TestStatusAuth401PausesQueue(t *testing.T) {
+	f := newFakeSPN2(t)
+	f.submitFn = func(target string, nth int) fakeResp { return submitOK("job-401") }
+	f.statusFn = func(jobID string, nth int) fakeResp {
+		return fakeResp{code: http.StatusUnauthorized, body: `{"status":"error","status_ext":"error:unauthorized"}`}
+	}
+	r, st := newTestRunner(t, f, testLimits())
+
+	target := "https://example.com/"
+	events, sum, err := runAll(t, context.Background(), r, []string{target}, spn2.Options{}, false)
+	require.Error(t, err, "a status-endpoint 401 must surface from the completion func")
+	require.Contains(t, err.Error(), "авторизации")
+	require.Equal(t, Summary{}, sum)
+
+	authEvents := 0
+	for _, ev := range events {
+		if ev.Kind == EventAuth {
+			authEvents++
+		}
+	}
+	require.Equal(t, 1, authEvents, "exactly one auth event must be emitted")
+
+	// Not terminal-failed: the submitted job stays submitted for the
+	// next run's resume.
+	rec := mustRecord(t, st, target)
+	require.Equal(t, journal.StateSubmitted, rec.State)
+	require.Empty(t, rec.ErrKind)
+}
+
+func TestUserStatusAuth401PausesQueue(t *testing.T) {
+	f := newFakeSPN2(t)
+	f.submitFn = func(target string, nth int) fakeResp {
+		return fakeResp{code: http.StatusOK, body: `{"status":"error","status_ext":"error:user-session-limit","message":"session busy"}`}
+	}
+	f.userFn = func() fakeResp {
+		return fakeResp{code: http.StatusUnauthorized, body: `{"status":"error","status_ext":"error:unauthorized"}`}
+	}
+	lim := testLimits()
+	lim.JobWait = 300 * time.Millisecond
+	r, st := newTestRunner(t, f, lim)
+
+	target := "https://example.com/"
+	events, sum, err := runAll(t, context.Background(), r, []string{target}, spn2.Options{}, false)
+	require.Error(t, err, "a UserStatus 401 must surface from the completion func")
+	require.Contains(t, err.Error(), "авторизации")
+	require.Equal(t, Summary{}, sum)
+
+	authEvents := 0
+	for _, ev := range events {
+		if ev.Kind == EventAuth {
+			authEvents++
+		}
+	}
+	require.Equal(t, 1, authEvents, "exactly one auth event must be emitted")
+
+	// No spin: the session wait must stop on the first auth failure.
+	require.Equal(t, 1, f.userCount(), "UserStatus must be probed exactly once before the pause")
+	require.Equal(t, 1, f.count(f.submitsByTarget, target), "no resubmit behind a paused queue")
+
+	rec := mustRecord(t, st, target)
+	require.Equal(t, journal.StateQueued, rec.State)
+	require.Zero(t, rec.Attempts, "the auth refusal must not charge the attempt budget")
 }
 
 func TestJobWaitTimeoutMarksFailed(t *testing.T) {
