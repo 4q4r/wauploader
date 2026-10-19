@@ -34,8 +34,11 @@ var (
 	// slowDownWait is the reference-client default pause between 503
 	// SlowDown re-PUTs (ia upload -s/--sleep default: 30s).
 	slowDownWait = 30 * time.Second
-	// checkLimitPoll is the cadence of the awaitNotOverLimit poll loop.
-	checkLimitPoll = 15 * time.Second
+	// CheckLimitPoll is the cadence of the AwaitNotOverLimit poll loop
+	// (the preflight and the SlowDown re-PUT path). Exported so the
+	// upload runner's tests can shrink it — the ias3 tests shrink it
+	// the same way (tests run sequentially).
+	CheckLimitPoll = 15 * time.Second
 	// retryAfterUnit converts a Retry-After delay-seconds value into a
 	// wait; tests shrink it together with slowDownWait (tests run
 	// sequentially).
@@ -181,19 +184,23 @@ func parseOverLimit(raw json.RawMessage) (bool, error) {
 }
 
 // maxCheckLimitErrors caps CONSECUTIVE errored CheckLimit calls inside
-// awaitNotOverLimit. A legit over_limit=1 answer is valid server state
+// AwaitNotOverLimit. A legit over_limit=1 answer is valid server state
 // and keeps polling unbounded; a stably failing endpoint is an outage,
 // and polling it forever would hang the upload loop.
 const maxCheckLimitErrors = 8
 
-// awaitNotOverLimit polls CheckLimit until the overload flag clears or
+// awaitNotOverLimit → AwaitNotOverLimit export note: the upload runner
+// (internal/runner) consumes this poll loop for its per-file preflight;
+// the export is the sanctioned one-word change (Task 11).
+
+// AwaitNotOverLimit polls CheckLimit until the overload flag clears or
 // ctx ends. The loop is the fail-safe consumer of CheckLimit: an errored
-// check counts as "still overloaded" and keeps polling at checkLimitPoll
+// check counts as "still overloaded" and keeps polling at CheckLimitPoll
 // cadence, so a flapping endpoint never produces a false green light.
 // maxCheckLimitErrors consecutive errored checks (without a single
 // success in between) end the loop with the last error: the endpoint is
 // broken, not busy. A successful check resets the counter.
-func awaitNotOverLimit(ctx context.Context, c *Client, identifier string) error {
+func AwaitNotOverLimit(ctx context.Context, c *Client, identifier string) error {
 	consecutiveErrs := 0
 	for {
 		over, err := c.CheckLimit(ctx, identifier)
@@ -211,7 +218,7 @@ func awaitNotOverLimit(ctx context.Context, c *Client, identifier string) error 
 		if cerr := ctx.Err(); cerr != nil {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", cerr)
 		}
-		if !sleepCtx(ctx, checkLimitPoll) {
+		if !sleepCtx(ctx, CheckLimitPoll) {
 			return fmt.Errorf("ожидание снятия лимита загрузки прервано: %w", ctx.Err())
 		}
 	}
@@ -344,7 +351,7 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 //     ErrSpamSlowDown, NEVER retried;
 //   - 429 Too Many Requests (owner ruling, rclone precedent) and plain
 //     503 SlowDown, plus any 5xx whose body is not valid error XML →
-//     sleep, re-check via awaitNotOverLimit, re-PUT the whole file; at
+//     sleep, re-check via AwaitNotOverLimit, re-PUT the whole file; at
 //     most maxUploadAttempts PUTs total. A 429's Retry-After header is
 //     honored (delay-seconds), capped at the 30s default sleep; the spam
 //     sniff runs on 429 bodies too, before the retry decision;
@@ -489,7 +496,7 @@ func (c *Client) Upload(ctx context.Context, req UploadRequest, o HeaderOpts, pr
 			if !sleepCtx(ctx, wait) {
 				return fmt.Errorf("загрузка %s прервана во время ожидания после HTTP %d: %w", req.Key, status, ctx.Err())
 			}
-			if err := awaitNotOverLimit(ctx, c, req.Identifier); err != nil {
+			if err := AwaitNotOverLimit(ctx, c, req.Identifier); err != nil {
 				return fmt.Errorf("загрузка %s: %w", req.Key, err)
 			}
 			continue // whole-file re-PUT

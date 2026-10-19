@@ -458,3 +458,24 @@ func TestWaitDeriveTimeoutGuard(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "интервал опроса", "the poll guard must stand")
 }
+
+// TestHasActiveTasks: the skip-guard primitive (reference-client
+// semantics) — ANY catalog task counts as active regardless of its
+// command (archive.php ingest included); an empty catalog is quiet;
+// an error envelope is an error, never a silent false.
+func TestHasActiveTasks(t *testing.T) {
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil, nil))
+	active, err := cl.HasActiveTasks(context.Background(), "testid1")
+	require.NoError(t, err)
+	assert.True(t, active, "a catalog task of ANY command means the item is busy")
+
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_none.json", nil, nil))
+	active, err = cl.HasActiveTasks(context.Background(), "testid1")
+	require.NoError(t, err)
+	assert.False(t, active, "an empty catalog means no active tasks")
+
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil, nil))
+	active, err = cl.HasActiveTasks(context.Background(), "testid1")
+	require.Error(t, err)
+	assert.False(t, active, "an error must not read as a false negative")
+}
