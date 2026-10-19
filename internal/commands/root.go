@@ -325,10 +325,34 @@ func uploadSummaryLine(con *console.Console, s runner.Summary) {
 	con.Infof("Итог: загружено %d · пропущено %d · отложено %d · ошибок %d", s.Done, s.Skipped, s.Parked, s.Failed)
 }
 
+// usageNoArgs and usageMaximumNArgs wrap cobra's positional-args validators
+// so a violation is classified as a usage error (exit 2) instead of an
+// unclassified failure (exit 1). Flag-parse errors are classified the same
+// way through the root's FlagErrorFunc (see NewRootCommand).
+func usageNoArgs(cmd *cobra.Command, args []string) error {
+	if err := cobra.NoArgs(cmd, args); err != nil {
+		return exitUsage("%v", err)
+	}
+
+	return nil
+}
+
+func usageMaximumNArgs(n int) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		if err := cobra.MaximumNArgs(n)(cmd, args); err != nil {
+			return exitUsage("%v", err)
+		}
+
+		return nil
+	}
+}
+
 // NewRootCommand wires the whole CLI: global persistent flags, then every
 // subcommand. Pointers reference the caller's flag values (the version and
 // init commands share the pattern); main maps returned ExitError values to
-// process exit codes.
+// process exit codes. The FlagErrorFunc classifies every flag-parse error
+// (unknown flag, bad value — root-inherited, so every subcommand) as a
+// usage error (exit 2).
 func NewRootCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *bool) *cobra.Command {
 	root := &cobra.Command{
 		Use:           version.Name,
@@ -339,6 +363,9 @@ func NewRootCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *b
 			DisableDefaultCmd: true, // not part of the documented CLI surface (Task 1 M2 carry)
 		},
 	}
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return exitUsage("%v", err)
+	})
 	root.PersistentFlags().StringVar(configPath, "config",
 		"~/.config/wauploader/wauploader.toml", "путь к файлу конфигурации")
 	root.PersistentFlags().StringVar(journalPath, "journal",

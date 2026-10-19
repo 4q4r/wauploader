@@ -138,13 +138,15 @@ func IsTTY(f *os.File) bool {
 
 // FormatBytesRU renders a byte count in Russian units (Б/КБ/МБ/ГБ/ТБ) with
 // one decimal digit and a comma separator, e.g. "1,5 ГБ". Negative values
-// use the absolute magnitude.
+// use the absolute magnitude — computed exactly in uint64, since -MinInt64
+// overflows int64.
 func FormatBytesRU(n int64) string {
+	u := uint64(n)
 	if n < 0 {
-		n = -n
+		u = uint64(-(n + 1)) + 1 // exact abs: MinInt64 → 2^63, no overflow
 	}
 
-	value := float64(n)
+	value := float64(u)
 
 	unit := 0
 	for value >= 1024 && unit < len(byteUnits)-1 {

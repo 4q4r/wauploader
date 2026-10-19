@@ -3,6 +3,7 @@ package console
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"regexp"
 	"strings"
@@ -272,6 +273,12 @@ func TestFormatBytesRUBoundaries(t *testing.T) {
 		{"tebibyte", 1099511627776, "1,0 ТБ"},
 		{"negative uses abs", -512, "512,0 Б"},
 		{"negative kibibyte uses abs", -1024, "1,0 КБ"},
+		// The exact absolute value of MinInt64 overflows int64; the
+		// magnitude must be computed in uint64 — no minus sign, exact
+		// unsigned magnitude 2^63 = 8388608 ТБ (the unit ladder caps
+		// at terabytes).
+		{"min int64 exact unsigned magnitude", math.MinInt64, "8388608,0 ТБ"},
+		{"min int64 plus one", math.MinInt64 + 1, "8388608,0 ТБ"},
 	}
 
 	for _, tc := range tests {
