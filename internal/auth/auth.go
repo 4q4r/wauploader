@@ -43,14 +43,24 @@ var (
 )
 
 // maxLoginTimeout bounds a single xauthn exchange; the reference client
-// uses 10s, doubled here because IA services can be slow (plan T5).
-const maxLoginTimeout = 30 * time.Second
+// uses 10s, doubled here because IA services can be slow (plan T5). It is
+// a package-level var so tests can shrink it (same pattern as
+// postLoginPause); tests run sequentially, making the mutation race-free.
+var maxLoginTimeout = 30 * time.Second
 
 // maxBodyRead caps how many response bytes are read before parsing.
 const maxBodyRead = 1 << 20
 
 // maxErrorBody caps the raw response fragment embedded in an error.
 const maxErrorBody = 200
+
+// ErrCookiesNotReturned is returned by Bootstrap together with usable
+// key-only credentials: archive.org confirmed the login and issued the
+// IA-S3 keys, but sent no (or a partial) login cookie pair. Keys work for
+// both SPN2 (auto/keys modes) and IA-S3, so the caller may persist the
+// keys and surface the sentinel's Russian text as a warning instead of
+// failing. It never wraps other errors.
+var ErrCookiesNotReturned = errors.New("куки не получены — SPN2 будет работать по ключам")
 
 // Credentials holds one archive.org identity: IA-S3 keys and the SPN2 login
 // cookies. Any subset may be populated; Resolve guarantees at least one
@@ -211,25 +221,30 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	if password == "" {
 		return Credentials{}, errors.New("не указан пароль archive.org")
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxLoginTimeout)
-	defer cancel()
+	// The login deadline bounds only the exchange itself; the courtesy
+	// pause below runs on the caller's ctx, so a near-deadline success is
+	// never overwritten by a pause error.
+	loginCtx, cancelLogin := context.WithTimeout(ctx, maxLoginTimeout)
+	defer cancelLogin()
 
 	form := url.Values{"email": {email}, "password": {password}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, xauthnEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(loginCtx, http.MethodPost, xauthnEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org: построить запрос xauthn: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := cl.DoWithRetry(ctx, req, httpx.RetryOpts{Mode: httpx.RetryConnectOnly})
+	resp, err := cl.DoWithRetry(loginCtx, req, httpx.RetryOpts{Mode: httpx.RetryConnectOnly})
 	if err != nil {
 		return Credentials{}, fmt.Errorf("вход archive.org (xauthn) не выполнен: %w", err)
 	}
 	// Reference behavior: sleep after the call, on every answered path.
+	// The pause uses the PARENT context (the login deadline may be nearly
+	// spent when the exchange completes) and its outcome never overwrites
+	// the exchange result: a pause interrupted by context cancellation
+	// must not replace fresh credentials with a pause error.
 	defer func() {
-		if perr := awaitRateCourtesy(ctx); perr != nil && err == nil {
-			creds, err = Credentials{}, perr
-		}
+		_ = awaitRateCourtesy(ctx)
 	}()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
@@ -258,15 +273,16 @@ func Bootstrap(ctx context.Context, cl *httpx.Client, email, password string) (c
 	if v.S3.Access == "" || v.S3.Secret == "" {
 		return Credentials{}, errors.New("вход выполнен, но archive.org не вернул S3-ключи: сгенерируйте их вручную на https://archive.org/account/s3.php")
 	}
+	creds = Credentials{Access: v.S3.Access, Secret: v.S3.Secret}
 	if v.Cookies.LoggedInUser == "" || v.Cookies.LoggedInSig == "" {
-		return Credentials{}, errors.New("вход выполнен, но archive.org не вернул куки входа: SPN2-режим по ключам продолжит работу")
+		// Keys without cookies are a usable state: Resolve accepts
+		// key-only credentials in auto/keys modes, so return the keys and
+		// let the caller decide (persist + warn), never lose them.
+		return creds, ErrCookiesNotReturned
 	}
-	return Credentials{
-		Access:     v.S3.Access,
-		Secret:     v.S3.Secret,
-		CookieUser: v.Cookies.LoggedInUser,
-		CookieSig:  v.Cookies.LoggedInSig,
-	}, nil
+	creds.CookieUser = v.Cookies.LoggedInUser
+	creds.CookieSig = v.Cookies.LoggedInSig
+	return creds, nil
 }
 
 // refusalError builds the Russian failure message for a success:false
