@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 
+	"github.com/4q4r/wauploader/internal/commands"
 	"github.com/4q4r/wauploader/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -39,5 +40,6 @@ func newRootCommand() *cobra.Command {
 		"disable colored terminal output")
 
 	root.AddCommand(version.NewVersionCommand(&flags.jsonOutput))
+	root.AddCommand(commands.NewInitCommand(&flags.configPath, &flags.jsonOutput, &flags.noColor))
 	return root
 }
