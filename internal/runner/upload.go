@@ -371,65 +371,9 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 			continue
 		}
 
-		if ok {
-			// failed or skipped in a previous run: an explicit re-list
-			// resets the work fields but keeps the record — and the
-			// persisted digests, so the file is not re-hashed. The
-			// per-target metadata is refreshed from the fresh derivation.
-			if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, func(m *journal.Record) {
-				resetRecord(m)
-				m.Title, m.Description, m.Extra = t.Title, t.Description, t.Extra
-			}); err != nil {
-				r.con.Errorf("Не удалось сбросить запись журнала для %s: %v", t.Path, err)
-				return nil, fmt.Errorf("сброс записи журнала не выполнен: %w", err)
-			}
-
-			rec.State = journal.StateQueued
-			rec.ErrKind, rec.ErrMsg = "", ""
-
-			// Refresh the persisted metadata with the same guard
-			// semantics as mergeFreshMeta: fresh non-empty values win,
-			// persisted values are never wiped by an empty re-listing.
-			if t.Title != "" {
-				rec.Title = t.Title
-			}
-
-			if t.Description != "" {
-				rec.Description = t.Description
-			}
-
-			if len(t.Extra) > 0 {
-				rec.Extra = mergeExtra(t.Extra, rec.Extra)
-			}
-
-			// The in-memory target rides the merged values too, so an
-			// empty-fresh re-list still PUTs the journal-held metadata.
-			if t.Title == "" {
-				t.Title = rec.Title
-			}
-
-			if t.Description == "" {
-				t.Description = rec.Description
-			}
-
-			if len(t.Extra) == 0 {
-				t.Extra = rec.Extra
-			}
-		} else {
-			fresh := &journal.Record{
-				Kind:        journal.KindUpload,
-				Target:      tgt,
-				State:       journal.StateQueued,
-				Title:       t.Title,
-				Description: t.Description,
-				Extra:       t.Extra,
-			}
-			if err := r.st.Put(fresh); err != nil {
-				r.con.Errorf("Не удалось создать запись журнала для %s: %v", t.Path, err)
-				return nil, fmt.Errorf("создание записи журнала не выполнено: %w", err)
-			}
-
-			rec = fresh
+		rec, t, err = r.relistRecord(tgt, t, rec, ok)
+		if err != nil {
+			return nil, err
 		}
 
 		add(t, rec)
@@ -456,6 +400,76 @@ func (r *UploadRunner) planRun(targets []UploadTarget, events chan<- Event, c *c
 	}
 
 	return items, nil
+}
+
+// relistRecord prepares an explicitly re-listed target's journal record
+// (existed = the journal already holds one). A previous run's record
+// (failed or skipped) is reset to queued — keeping the record and the
+// persisted digests, so the file is not re-hashed — and its per-target
+// metadata is refreshed with the mergeFreshMeta guard semantics: fresh
+// non-empty values win, persisted values are never wiped by an empty
+// re-listing. The in-memory target rides the merged values too, so an
+// empty-fresh re-list still PUTs the journal-held metadata. A first-seen
+// target gets a fresh queued record.
+func (r *UploadRunner) relistRecord(tgt string, t UploadTarget, rec *journal.Record, existed bool) (*journal.Record, UploadTarget, error) {
+	if !existed {
+		fresh := &journal.Record{
+			Kind:        journal.KindUpload,
+			Target:      tgt,
+			State:       journal.StateQueued,
+			Title:       t.Title,
+			Description: t.Description,
+			Extra:       t.Extra,
+		}
+		if err := r.st.Put(fresh); err != nil {
+			r.con.Errorf("Не удалось создать запись журнала для %s: %v", t.Path, err)
+			return nil, t, fmt.Errorf("создание записи журнала не выполнено: %w", err)
+		}
+
+		return fresh, t, nil
+	}
+
+	if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, func(m *journal.Record) {
+		resetRecord(m)
+		m.Title, m.Description, m.Extra = t.Title, t.Description, t.Extra
+	}); err != nil {
+		r.con.Errorf("Не удалось сбросить запись журнала для %s: %v", t.Path, err)
+		return nil, t, fmt.Errorf("сброс записи журнала не выполнен: %w", err)
+	}
+
+	rec.State = journal.StateQueued
+	rec.ErrKind, rec.ErrMsg = "", ""
+
+	// Refresh the persisted metadata with the same guard semantics as
+	// mergeFreshMeta: fresh non-empty values win, persisted values are
+	// never wiped by an empty re-listing.
+	if t.Title != "" {
+		rec.Title = t.Title
+	}
+
+	if t.Description != "" {
+		rec.Description = t.Description
+	}
+
+	if len(t.Extra) > 0 {
+		rec.Extra = mergeExtra(t.Extra, rec.Extra)
+	}
+
+	// The in-memory target rides the merged values too, so an
+	// empty-fresh re-list still PUTs the journal-held metadata.
+	if t.Title == "" {
+		t.Title = rec.Title
+	}
+
+	if t.Description == "" {
+		t.Description = rec.Description
+	}
+
+	if len(t.Extra) == 0 {
+		t.Extra = rec.Extra
+	}
+
+	return rec, t, nil
 }
 
 // mergeExtra unions two Extra maps per key, order-preserving: the fresh
