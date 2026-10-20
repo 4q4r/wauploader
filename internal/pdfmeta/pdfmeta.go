@@ -323,7 +323,9 @@ func deriveTitle(pdfTitle, author string, topicWords []string) string {
 
 	if strings.HasPrefix(strings.ToLower(title), msWordTitlePrefix) {
 		rest := strings.TrimSpace(strings.ReplaceAll(title[len(msWordTitlePrefix):], "_", " "))
-		if utf8.RuneCountInString(rest) >= 4 {
+		// The remainder must ALSO clear the junk rules: a source-file
+		// leak like "Document1.doc" is junk at any length (round-4 🟡).
+		if utf8.RuneCountInString(rest) >= 4 && !isJunkTitle(rest) {
 			return rest
 		}
 

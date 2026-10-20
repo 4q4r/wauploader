@@ -251,6 +251,13 @@ func TestDeriveMetaMSWordTitleStripped(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "Sport war", m.Title)
 
+	// A 4+-char remainder is still junk when it is a source-file leak
+	// (round-4 🟡): ext-suffix check applies to the remainder too.
+	fakePair(t, "Title:           Microsoft Word - Document1.doc\nPages:  1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Sport war", m.Title)
+
 	// The lowercase prefix form strips too; the remainder keeps its case.
 	fakePair(t, "Title:           microsoft word - good enough title\nPages:  1\n", "ascii text.")
 	m, err = DeriveMeta(path, "athens", CreatorSourceFile)

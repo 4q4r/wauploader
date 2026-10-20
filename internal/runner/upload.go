@@ -429,9 +429,26 @@ func (r *UploadRunner) relistRecord(tgt string, t UploadTarget, rec *journal.Rec
 		return fresh, t, nil
 	}
 
+	// Compute the MERGED metadata FIRST and use the same values for the
+	// journal record (persisted by the UpdateState below), the in-memory
+	// record and the target — the reset-time write must never persist
+	// raw empty fresh values (round-4 🟠). Guards: fresh non-empty wins;
+	// persisted values are never wiped by an empty re-listing; Extra per
+	// name — fresh replaces, held fills missing names (mergeExtra).
+	mergedTitle, mergedDescription := t.Title, t.Description
+	if mergedTitle == "" {
+		mergedTitle = rec.Title
+	}
+
+	if mergedDescription == "" {
+		mergedDescription = rec.Description
+	}
+
+	mergedExtra := mergeExtra(t.Extra, rec.Extra)
+
 	if err := r.st.UpdateState(journal.KindUpload, tgt, journal.StateQueued, func(m *journal.Record) {
 		resetRecord(m)
-		m.Title, m.Description, m.Extra = t.Title, t.Description, t.Extra
+		m.Title, m.Description, m.Extra = mergedTitle, mergedDescription, mergedExtra
 	}); err != nil {
 		r.con.Errorf("Не удалось сбросить запись журнала для %s: %v", t.Path, err)
 		return nil, t, fmt.Errorf("сброс записи журнала не выполнен: %w", err)
@@ -439,43 +456,21 @@ func (r *UploadRunner) relistRecord(tgt string, t UploadTarget, rec *journal.Rec
 
 	rec.State = journal.StateQueued
 	rec.ErrKind, rec.ErrMsg = "", ""
-
-	// Refresh the persisted metadata with the same guard semantics as
-	// mergeFreshMeta: fresh non-empty values win, persisted values are
-	// never wiped by an empty re-listing.
-	if t.Title != "" {
-		rec.Title = t.Title
-	}
-
-	if t.Description != "" {
-		rec.Description = t.Description
-	}
-
-	if len(t.Extra) > 0 {
-		rec.Extra = mergeExtra(t.Extra, rec.Extra)
-	}
+	rec.Title, rec.Description, rec.Extra = mergedTitle, mergedDescription, mergedExtra
 
 	// The in-memory target rides the merged values too, so an
 	// empty-fresh re-list still PUTs the journal-held metadata.
-	if t.Title == "" {
-		t.Title = rec.Title
-	}
-
-	if t.Description == "" {
-		t.Description = rec.Description
-	}
-
-	if len(t.Extra) == 0 {
-		t.Extra = rec.Extra
-	}
+	t.Title, t.Description, t.Extra = mergedTitle, mergedDescription, mergedExtra
 
 	return rec, t, nil
 }
 
-// mergeExtra unions two Extra maps per key, order-preserving: the fresh
-// values ride as-is first, held (journal) values append ONLY when not
-// already present for that key — an identical re-derivation on resume
-// must not duplicate subject values on the wire.
+// mergeExtra merges held (journal) Extra into fresh Extra BY NAME: for
+// every name present in fresh, the fresh values REPLACE the held ones
+// entirely — a --meta subject=x retry must not resurrect the derived
+// subjects, and a creator-source both→file retry must drop the PDF Author
+// value. Held values fill in only for names fresh does not carry. Values
+// within one name stay order-preserving and deduplicated.
 func mergeExtra(fresh, held ias3.Meta) ias3.Meta {
 	if len(fresh) == 0 {
 		return held
@@ -483,18 +478,34 @@ func mergeExtra(fresh, held ias3.Meta) ias3.Meta {
 
 	merged := make(ias3.Meta, len(fresh)+len(held))
 	for name, values := range fresh {
-		merged[name] = append(merged[name], values...)
+		merged[name] = dedupeStrings(values)
 	}
 
 	for name, values := range held {
-		for _, v := range values {
-			if !containsString(merged[name], v) {
-				merged[name] = append(merged[name], v)
-			}
+		if _, freshHasName := fresh[name]; freshHasName {
+			continue
 		}
+
+		merged[name] = append(merged[name], values...)
 	}
 
 	return merged
+}
+
+// dedupeStrings copies values keeping the first occurrence of each string.
+func dedupeStrings(values []string) []string {
+	if len(values) <= 1 {
+		return values
+	}
+
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if !containsString(out, v) {
+			out = append(out, v)
+		}
+	}
+
+	return out
 }
 
 func containsString(values []string, v string) bool {
