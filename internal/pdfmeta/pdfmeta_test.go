@@ -182,16 +182,117 @@ func TestDeriveMetaFullFromPdfMetadata(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "01_schmitz_aristophanes_frogs.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceBoth)
 	require.NoError(t, err)
 	require.Equal(t, Meta{
 		Title:       "Aristophanes Frogs and reading culture",
-		Creator:     "schmitz, Bernd Seidensticker",
+		Creators:    []string{"schmitz", "Bernd Seidensticker"},
 		Year:        "2021",
 		Description: "The Journal of Hellenic Studies (2023), 143, 147-166 RESEARCH ARTICLE Aristophanes' Frogs and reading culture in Athens.",
 		Subjects:    []string{"athens", "aristophanes frogs"},
 		Language:    "eng",
 	}, m)
+}
+
+// --- junk-title fallback (owner fix batch) -----------------------------------
+
+// A hex-blob placeholder title (an InDesign/Quark export leak) is junk:
+// the title falls back to the humanized topic phrase. The wrapping <> is
+// optional and the match is case-insensitive.
+func TestDeriveMetaJunkHexTitleFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	path := touch(t, dir, "02_prokopyeva_kalokagathia.pdf")
+
+	fakePair(t,
+		"Title:           <E2E5F1F2EDE8EA5FE3F3EC31342E696E6464>\nPages:  2\n",
+		"ascii text for the language gate.")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Kalokagathia", m.Title, "a hex placeholder must not ship as the title")
+
+	// Unwrapped lowercase hex is junk too.
+	fakePair(t, "Title:           deadbeefcafe0123456789ab\nPages:  1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Kalokagathia", m.Title)
+}
+
+// A layout/source-tool filename leak (.indb/.indd/.qxd/.docx/.doc/.pptx/
+// .wpd, case-insensitive) as the PDF title is junk: topic-phrase fallback.
+func TestDeriveMetaJunkExtTitleFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	path := touch(t, dir, "06_darwin_notebooks.pdf")
+
+	for _, title := range []string{"September_6_183.indb", "Layout.qxd", "doc1.DOCX", "paper.doc", "slides.pptx", "old.wpd"} {
+		fakePair(t, "Title:           "+title+"\nPages:  1\n", "ascii text.")
+		m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+		require.NoError(t, err)
+		require.Equal(t, "Notebooks", m.Title, "junk ext title %q", title)
+	}
+}
+
+// The "Microsoft Word - " prefix is stripped (underscores→spaces, trim);
+// a remainder of ≥4 chars becomes the title AS-IS, a shorter one falls
+// back to the topic phrase. The prefix match is case-insensitive.
+func TestDeriveMetaMSWordTitleStripped(t *testing.T) {
+	dir := t.TempDir()
+	path := touch(t, dir, "05_pritchard_sport_war.pdf")
+
+	fakePair(t,
+		"Title:           Microsoft Word - English_Text_of_the_Seminar_by_PRITCHARD_on_6_December_2020\nPages:  1\n",
+		"ascii text.")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "English Text of the Seminar by PRITCHARD on 6 December 2020", m.Title)
+
+	// A too-short remainder falls back to the topic phrase.
+	fakePair(t, "Title:           Microsoft Word - ab\nPages:  1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Sport war", m.Title)
+
+	// The lowercase prefix form strips too; the remainder keeps its case.
+	fakePair(t, "Title:           microsoft word - good enough title\nPages:  1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "good enough title", m.Title)
+}
+
+// A whitespace-only (or absent) title is junk: topic-phrase fallback.
+func TestDeriveMetaWhitespaceTitleFallsBack(t *testing.T) {
+	fakePair(t, "Title:          \nPages:          1\n", "ascii text.")
+	dir := t.TempDir()
+	path := touch(t, dir, "01_ivanov_komedia.pdf")
+
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Komedia", m.Title)
+}
+
+// The filename fallback humanizes the TOPIC phrase: hyphens become spaces
+// too, whitespace runs collapse, and only the phrase's first letter is
+// capitalized. A degenerate file without topic words falls back to the
+// author segment.
+func TestDeriveMetaTopicPhraseHumanization(t *testing.T) {
+	dir := t.TempDir()
+
+	path := touch(t, dir, "01_ivanov_reading-culture.pdf")
+	fakePair(t, "Pages:          1\n", "ascii text.")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Reading culture", m.Title)
+
+	path = touch(t, dir, "02_smith_multi--word_topic.pdf")
+	fakePair(t, "Pages:          1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Multi word topic", m.Title)
+
+	path = touch(t, dir, "03_petrov.pdf")
+	fakePair(t, "Pages:          1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, "Petrov", m.Title, "no topic words — the author carries the fallback title")
 }
 
 func TestDeriveMetaTitleFallsBackToFilename(t *testing.T) {
@@ -200,10 +301,10 @@ func TestDeriveMetaTitleFallsBackToFilename(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "02_prokopyeva_kalokagathia.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceBoth)
 	require.NoError(t, err)
-	require.Equal(t, "Prokopyeva Kalokagathia", m.Title)
-	require.Equal(t, "prokopyeva, Someone", m.Creator)
+	require.Equal(t, "Kalokagathia", m.Title, "empty title is junk — the humanized topic phrase carries the title")
+	require.Equal(t, []string{"prokopyeva", "Someone"}, m.Creators)
 	require.Equal(t, "2007", m.Year)
 }
 
@@ -213,7 +314,7 @@ func TestDeriveMetaLanguageRus(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "01_ivanov_komedia.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
 	require.NoError(t, err)
 	require.Equal(t, "rus", m.Language)
 	require.Equal(t, "2015", m.Year)
@@ -230,7 +331,7 @@ func TestDeriveMetaLanguageRusAfterLongEnglishAbstract(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "01_ivanov_komedia.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
 	require.NoError(t, err)
 	require.Equal(t, "rus", m.Language, "the Russian body must win over the English front matter")
 	// The description budget is unchanged: capped at 500 runes of the head.
@@ -244,7 +345,7 @@ func TestDeriveMetaLanguageOmittedWhenMixed(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "01_x_topic.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
 	require.NoError(t, err)
 	require.Empty(t, m.Language)
 }
@@ -254,9 +355,9 @@ func TestDeriveMetaNoPdfAuthorOnlyFilenameSegment(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "05_pritchard_sport_war.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
 	require.NoError(t, err)
-	require.Equal(t, "pritchard", m.Creator)
+	require.Equal(t, []string{"pritchard"}, m.Creators)
 }
 
 func TestDeriveMetaFilenameWithoutLeadingNumber(t *testing.T) {
@@ -264,7 +365,7 @@ func TestDeriveMetaFilenameWithoutLeadingNumber(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "chapter_one.pdf")
 
-	_, err := DeriveMeta(path, "athens")
+	_, err := DeriveMeta(path, "athens", CreatorSourceFile)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "chapter_one.pdf")
 	require.Contains(t, err.Error(), "NN_автор_тема")
@@ -275,9 +376,86 @@ func TestDeriveMetaDescriptionCappedAtMaxChars(t *testing.T) {
 	dir := t.TempDir()
 	path := touch(t, dir, "01_a_topic.pdf")
 
-	m, err := DeriveMeta(path, "athens")
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len([]rune(m.Description)), 500)
+}
+
+// --- creator source (owner fix batch) ----------------------------------------
+
+func TestParseCreatorSource(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want CreatorSource
+	}{
+		{"", CreatorSourceFile}, // absent flag = file (the documented default)
+		{"file", CreatorSourceFile},
+		{"pdf", CreatorSourcePDF},
+		{"both", CreatorSourceBoth},
+	} {
+		got, err := ParseCreatorSource(tc.in)
+		require.NoError(t, err, "input %q", tc.in)
+		require.Equal(t, tc.want, got, "input %q", tc.in)
+	}
+
+	_, err := ParseCreatorSource("dropbox")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--creator-source")
+	require.Contains(t, err.Error(), "file")
+	require.Contains(t, err.Error(), "pdf")
+	require.Contains(t, err.Error(), "both")
+}
+
+// The creator source selects the values: file = filename author only
+// (default), pdf = PDF Author only, both = file author first then the
+// PDF Author as distinct values.
+func TestDeriveMetaCreatorsBySource(t *testing.T) {
+	fakePair(t, fullPdfinfoOut, "ascii text.") // Author: Bernd Seidensticker
+	dir := t.TempDir()
+	path := touch(t, dir, "01_schmitz_aristophanes_frogs.pdf")
+
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Equal(t, []string{"schmitz"}, m.Creators)
+
+	m, err = DeriveMeta(path, "athens", CreatorSourcePDF)
+	require.NoError(t, err)
+	require.Equal(t, []string{"Bernd Seidensticker"}, m.Creators)
+
+	m, err = DeriveMeta(path, "athens", CreatorSourceBoth)
+	require.NoError(t, err)
+	require.Equal(t, []string{"schmitz", "Bernd Seidensticker"}, m.Creators)
+}
+
+// both collapses case-insensitive duplicates to one value; a pdf source
+// with no PDF Author leaves the creators empty (the field is omitted).
+func TestDeriveMetaCreatorsDistinctAndPDFEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := touch(t, dir, "01_schmitz_topic.pdf")
+
+	fakePair(t, "Title:          X\nAuthor:          Schmitz\nPages:  1\n", "ascii text.")
+	m, err := DeriveMeta(path, "athens", CreatorSourceBoth)
+	require.NoError(t, err)
+	require.Equal(t, []string{"schmitz"}, m.Creators, "case-insensitive duplicates collapse")
+
+	fakePair(t, "Title:          X\nPages:  1\n", "ascii text.")
+	m, err = DeriveMeta(path, "athens", CreatorSourcePDF)
+	require.NoError(t, err)
+	require.Empty(t, m.Creators)
+}
+
+// --- degenerate description (owner fix batch) ---------------------------------
+
+// A whitespace-only first page yields an EMPTY description — never a
+// whitespace blob (the field is omitted from headers and the dry-run).
+func TestDeriveMetaWhitespaceOnlyFirstPageEmptyDescription(t *testing.T) {
+	fakePair(t, "Title:          X\nPages:  1\n", "  \n\t \x0c  \n")
+	dir := t.TempDir()
+	path := touch(t, dir, "01_a_topic.pdf")
+
+	m, err := DeriveMeta(path, "athens", CreatorSourceFile)
+	require.NoError(t, err)
+	require.Empty(t, m.Description)
 }
 
 // --- Identifier --------------------------------------------------------------
