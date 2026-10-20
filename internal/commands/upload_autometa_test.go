@@ -119,7 +119,7 @@ func TestUploadAutoMetaDryRunPlan(t *testing.T) {
 	require.Contains(t, r.out, "Derived Title From PDF")
 	require.Contains(t, r.out, "opensource_texts")
 	require.Contains(t, r.out, "eng")
-	require.Contains(t, r.out, "Автор: test, PDF Author", "creator must be on the review surface")
+	require.Contains(t, r.out, "Автор: test", "creator must be on the review surface (default file source)")
 	require.Contains(t, r.out, "Темы: athens, author topic", "subjects must be on the review surface")
 	require.Contains(t, r.out, "Описание: The first page text with ascii dominance.", "a description head must be shown")
 	require.Contains(t, r.out, "Итог dry-run")
@@ -176,7 +176,8 @@ func TestUploadAutoMetaFullRun(t *testing.T) {
 	assert.Equal(t, "author topic", hdr.Get("x-archive-meta01-subject"))
 	assert.Equal(t, "eng", hdr.Get("x-archive-meta-language"))
 	assert.Equal(t, "2021", hdr.Get("x-archive-meta-year"))
-	assert.Equal(t, "test, PDF Author", hdr.Get("x-archive-meta-creator"))
+	assert.Equal(t, "test", hdr.Get("x-archive-meta-creator"), "default --creator-source file: filename author only")
+	assert.Empty(t, hdr.Get("x-archive-meta00-creator"), "single creator value rides unnumbered")
 
 	// The derived identifier and title surface in the RU console output.
 	require.Contains(t, r.out, "athens-1-test-author-topic")
@@ -225,4 +226,149 @@ func TestUploadAutoMetaLanguageRusPlan(t *testing.T) {
 	require.Equal(t, ExitOK, r.code)
 	require.Contains(t, r.out, "rus")
 	require.Empty(t, fb.requests())
+}
+
+// TestUploadAutoMetaExplicitFlagsOverrideDerived (owner fix batch):
+// explicitly passed flags override the auto-meta values per parameter —
+// --title/--description replace the derived fields; a --meta name wins
+// entirely for that name while derived names not mentioned stay. The
+// dry-run review surface shows the overridden (final) values.
+func TestUploadAutoMetaExplicitFlagsOverrideDerived(t *testing.T) {
+	fb := newFakeBackend(t)
+	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
+	cfg := writeTestConfig(t, testConfigFull)
+	file := autoMetaFixture(t)
+	jp := filepath.Join(t.TempDir(), "journal.bbolt")
+
+	r := runRoot(t, "--config", cfg, "--journal", jp, "upload", "--auto-meta",
+		"--identifier-scheme", "dir-nn-slug", "--collection", "opensource_texts", "--mediatype", "texts",
+		"--title", "Custom Title", "--description", "Custom description",
+		"--meta", "subject=x", "--meta", "publisher=MIT", file)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Equal(t, 1, fb.puts)
+
+	fb.mu.Lock()
+	hdr := fb.putHeaders[0]
+	fb.mu.Unlock()
+
+	assert.Equal(t, "Custom Title", hdr.Get("x-archive-meta-title"), "--title overrides the derived title")
+	assert.Equal(t, "Custom description", hdr.Get("x-archive-meta-description"), "--description overrides the derived description")
+	assert.Equal(t, "x", hdr.Get("x-archive-meta-subject"), "explicit subject wins entirely for the name")
+	assert.Empty(t, hdr.Get("x-archive-meta00-subject"), "no numbered subject: the derived values are dropped for the name")
+	assert.Equal(t, "MIT", hdr.Get("x-archive-meta-publisher"), "names the derivation never emits ride along")
+	assert.Equal(t, "eng", hdr.Get("x-archive-meta-language"), "derived names not mentioned stay")
+	assert.Equal(t, "2021", hdr.Get("x-archive-meta-year"))
+	assert.Equal(t, "test", hdr.Get("x-archive-meta-creator"))
+
+	// The dry-run surface shows the final (overridden) values — against a
+	// fresh backend and journal: the full run above legitimately issued
+	// requests.
+	fbDry := newFakeBackend(t)
+	r = runRoot(t, "--config", cfg, "upload", "--auto-meta", "--identifier-scheme", "dir-nn-slug",
+		"--collection", "opensource_texts", "--mediatype", "texts", "--dry-run",
+		"--title", "Custom Title", "--meta", "subject=x", file)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.out, "Название: «Custom Title»")
+	require.Contains(t, r.out, "Темы: x")
+	require.NotContains(t, r.out, "Derived Title From PDF")
+	require.Empty(t, fbDry.requests(), "dry-run must not issue any HTTP request")
+}
+
+// TestUploadAutoMetaCreatorSource (owner fix batch): --creator-source
+// selects the creator values on the wire — default file (one unnumbered
+// header), pdf (the PDF Author), both (numbered multi-value headers,
+// file author first).
+func TestUploadAutoMetaCreatorSource(t *testing.T) {
+	cfg := writeTestConfig(t, testConfigFull)
+	file := autoMetaFixture(t)
+	// Each sub-run needs its own journal: with a shared one the second
+	// run would skip the file as already done and never PUT.
+	jp := func() string { return filepath.Join(t.TempDir(), "journal.bbolt") }
+
+	fb := newFakeBackend(t)
+	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
+	args := append([]string{"--config", cfg, "--journal", jp(), "upload", "--auto-meta",
+		"--identifier-scheme", "dir-nn-slug", "--collection", "opensource_texts", "--mediatype", "texts"}, file)
+	r := runRoot(t, args...) // no flag: default file
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	fb.mu.Lock()
+	hdr := fb.putHeaders[0]
+	fb.mu.Unlock()
+	assert.Equal(t, "test", hdr.Get("x-archive-meta-creator"))
+	assert.Empty(t, hdr.Get("x-archive-meta00-creator"))
+
+	fb = newFakeBackend(t)
+	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
+	args = append([]string{"--config", cfg, "--journal", jp(), "upload", "--auto-meta",
+		"--identifier-scheme", "dir-nn-slug", "--collection", "opensource_texts",
+		"--mediatype", "texts", "--creator-source", "pdf"}, file)
+	r = runRoot(t, args...)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	fb.mu.Lock()
+	hdr = fb.putHeaders[0]
+	fb.mu.Unlock()
+	assert.Equal(t, "PDF Author", hdr.Get("x-archive-meta-creator"), "pdf source: the PDF Author only")
+
+	fb = newFakeBackend(t)
+	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
+	args = append([]string{"--config", cfg, "--journal", jp(), "upload", "--auto-meta",
+		"--identifier-scheme", "dir-nn-slug", "--collection", "opensource_texts",
+		"--mediatype", "texts", "--creator-source", "both"}, file)
+	r = runRoot(t, args...)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	fb.mu.Lock()
+	hdr = fb.putHeaders[0]
+	fb.mu.Unlock()
+	assert.Equal(t, "test", hdr.Get("x-archive-meta00-creator"), "both: file author first")
+	assert.Equal(t, "PDF Author", hdr.Get("x-archive-meta01-creator"), "both: PDF author as a distinct value")
+	assert.Empty(t, hdr.Get("x-archive-meta-creator"), "multi-value creator rides numbered headers only")
+}
+
+// TestUploadAutoMetaCreatorSourceFlagContract: a bogus --creator-source
+// value is a usage error (exit 2), and without --auto-meta the flag is a
+// usage error too — both before any poppler work.
+func TestUploadAutoMetaCreatorSourceFlagContract(t *testing.T) {
+	newFakeBackend(t)
+	writeFakePoppler(t, fakePdfinfoOut, fakePdftotextOut)
+	cfg := writeTestConfig(t, testConfigFull)
+	file := autoMetaFixture(t)
+	base := []string{"--config", cfg, "upload", "--collection", "opensource_texts", "--mediatype", "texts", "--dry-run"}
+
+	r := runRoot(t, append(append([]string{}, base...), "--auto-meta", "--identifier-scheme", "dir-nn-slug",
+		"--creator-source", "dropbox", file)...)
+	require.Equal(t, ExitUsage, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.errOut, "--creator-source")
+	require.Contains(t, r.errOut, "file")
+
+	r = runRoot(t, append(append([]string{}, base...), "--item", "some-item-1",
+		"--creator-source", "file", file)...)
+	require.Equal(t, ExitUsage, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.errOut, "--auto-meta")
+}
+
+// TestUploadAutoMetaDegenerateDescriptionOmitted (owner fix batch): a
+// whitespace-only first page leaves the description empty — no
+// «Описание» line in the dry-run, no description header on the PUT.
+func TestUploadAutoMetaDegenerateDescriptionOmitted(t *testing.T) {
+	fb := newFakeBackend(t)
+	writeFakePoppler(t, "Title:          X\nPages:  1\n", "   \n\t \x0c ")
+	cfg := writeTestConfig(t, testConfigFull)
+	file := autoMetaFixture(t)
+
+	r := runRoot(t, "--config", cfg, "upload", "--auto-meta", "--identifier-scheme", "dir-nn-slug",
+		"--collection", "opensource_texts", "--mediatype", "texts", "--dry-run", file)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.NotContains(t, r.out, "Описание:")
+
+	jp := filepath.Join(t.TempDir(), "journal.bbolt")
+	r = runRoot(t, "--config", cfg, "--journal", jp, "upload", "--auto-meta",
+		"--identifier-scheme", "dir-nn-slug", "--collection", "opensource_texts",
+		"--mediatype", "texts", file)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Equal(t, 1, fb.puts)
+
+	fb.mu.Lock()
+	hdr := fb.putHeaders[0]
+	fb.mu.Unlock()
+	assert.Empty(t, hdr.Get("x-archive-meta-description"), "a degenerate description is omitted from the PUT")
 }

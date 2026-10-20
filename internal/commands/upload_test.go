@@ -64,6 +64,56 @@ func TestUploadIdentifierFromTemplate(t *testing.T) {
 	require.Equal(t, ExitUsage, r.code)
 }
 
+// TestUploadIdentifierFromBaseNoExt (owner fix batch): the template data
+// gains {{.BaseNoExt}} — the file name without its extension; {{.Base}}
+// keeps the full name.
+func TestUploadIdentifierFromBaseNoExt(t *testing.T) {
+	newFakeBackend(t)
+	cfg := writeTestConfig(t, testConfigFull)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "04_clark_spartan_women.pdf")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+	jp := filepath.Join(dir, "journal.bbolt")
+
+	r := runRoot(t, "--config", cfg, "--journal", jp, "upload", "--dry-run",
+		"--collection", "movies", "--mediatype", "movies",
+		"--identifier-from", "papers-{{.BaseNoExt}}", file)
+	require.Equal(t, ExitOK, r.code, "errOut=%s", r.errOut)
+	require.Contains(t, r.out, "Загрузить: ")
+	require.Contains(t, r.out, "papers-04_clark_spartan_women/04_clark_spartan_women.pdf")
+	require.NotContains(t, r.out, "papers-04_clark_spartan_women.pdf/", "the extension must not leak into the identifier")
+}
+
+// TestUploadManualDryRunEchoesMetadata (owner fix batch): without
+// --auto-meta the dry-run echoes the batch metadata after the Загрузить
+// line — Название, Описание and Темы, each only when the value is set.
+func TestUploadManualDryRunEchoesMetadata(t *testing.T) {
+	newFakeBackend(t)
+	cfg := writeTestConfig(t, testConfigFull)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "f.txt")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+	jp := filepath.Join(dir, "journal.bbolt")
+	base := []string{"--config", cfg, "--journal", jp, "upload", "--dry-run",
+		"--item", "echo-item-1", "--collection", "movies", "--mediatype", "movies"}
+
+	r := runRoot(t, append(append([]string{}, base...), "--title", "Echo Title",
+		"--description", "Echo description", "--meta", "subject=alpha", "--meta", "subject=beta", file)...)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.out, "Загрузить: ")
+	require.Contains(t, r.out, "Название: «Echo Title»")
+	require.Contains(t, r.out, "Описание: Echo description")
+	require.Contains(t, r.out, "Темы: alpha, beta")
+
+	// No metadata flags → no metadata echo lines at all.
+	r = runRoot(t, append(append([]string{}, base...), file)...)
+	require.Equal(t, ExitOK, r.code, "out=%s errOut=%s", r.out, r.errOut)
+	require.Contains(t, r.out, "Загрузить: ")
+	require.NotContains(t, r.out, "Название:")
+	require.NotContains(t, r.out, "Описание:")
+	require.NotContains(t, r.out, "Темы:")
+}
+
 // TestUploadRequiresKeysUpFront: a cookies-only configuration fails with
 // exit 3 BEFORE any hashing or network work — IA-S3 never accepts cookies
 // (auth.Resolve doc delegation).

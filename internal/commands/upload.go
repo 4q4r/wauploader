@@ -43,6 +43,7 @@ type uploadFlags struct {
 	identifierFrom          string
 	autoMeta                bool
 	identifierScheme        string
+	creatorSource           string
 }
 
 // schemeDirNNSlug is the only supported --identifier-scheme value: the
@@ -107,7 +108,12 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 		if tmpl != nil {
 			var b strings.Builder
 
-			data := struct{ Base string }{Base: filepath.Base(abs)}
+			base := filepath.Base(abs)
+
+			data := struct{ Base, BaseNoExt string }{
+				Base:      base,
+				BaseNoExt: strings.TrimSuffix(base, filepath.Ext(base)),
+			}
 			if err := tmpl.Execute(&b, data); err != nil {
 				return nil, errors.New("не удалось вычислить идентификатор для " + p + ": " + err.Error())
 			}
@@ -136,6 +142,12 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 // themselves — here only the flag contract is enforced). Every violation
 // is a usage error (exit 2).
 func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTarget, error) {
+	// The --creator-source VALUE is validated here, at the top of the
+	// contract, so a bogus value is a usage error before anything else.
+	if _, err := pdfmeta.ParseCreatorSource(f.creatorSource); err != nil {
+		return nil, err
+	}
+
 	if f.identifierScheme != "" && f.identifierScheme != schemeDirNNSlug {
 		return nil, errors.New("недопустимое значение --identifier-scheme: поддерживается только dir-nn-slug")
 	}
@@ -164,17 +176,30 @@ func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTar
 		return nil, errors.New("--identifier-scheme допустим только вместе с --auto-meta")
 	}
 
+	if f.creatorSource != "" {
+		return nil, errors.New("--creator-source допустим только вместе с --auto-meta: вне автометаданных авторы не выводятся")
+	}
+
 	return uploadTargetsFrom(paths, f)
 }
 
 // deriveAutoMetaTargets derives targets and metadata from the PDFs and
-// announces each derived identifier + title in human-readable mode. The
-// returned error is already exit-classified: duplicate identifiers are a
-// usage error (exit 2 — silent item-merge is worse), while convention and
-// poppler failures are data errors of the file set (exit 1, review ruling
-// of fix round 1).
-func deriveAutoMetaTargets(con *console.Console, paths []string, jsonOut bool) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
-	targets, metas, err := uploadAutoMetaTargets(paths)
+// announces each derived identifier + title in human-readable mode. opts
+// carries the explicitly passed metadata flags; creatorSourceFlag is the
+// --creator-source value (validated in the flag contract; parsed here as
+// the single derive-side parse point). The returned error is already
+// exit-classified: duplicate identifiers are a usage error (exit 2 —
+// silent item-merge is worse), while convention and poppler failures are
+// data errors of the file set (exit 1, review ruling of fix round 1).
+func deriveAutoMetaTargets(con *console.Console, paths []string, jsonOut bool,
+	opts ias3.HeaderOpts, creatorSourceFlag string,
+) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
+	creatorSrc, err := pdfmeta.ParseCreatorSource(creatorSourceFlag)
+	if err != nil {
+		return nil, nil, exitUsage("%v", err)
+	}
+
+	targets, metas, err := uploadAutoMetaTargets(paths, opts, creatorSrc)
 	if err != nil {
 		var dup *duplicateIdentifierError
 		if errors.As(err, &dup) {
@@ -211,8 +236,8 @@ func (e *duplicateIdentifierError) Error() string {
 // subjects and a description head.
 func printDryRunDetail(con *console.Console, meta pdfmeta.Meta, collection string) {
 	detail := "Название: «" + meta.Title + "»"
-	if meta.Creator != "" {
-		detail += " · Автор: " + meta.Creator
+	if len(meta.Creators) > 0 {
+		detail += " · Автор: " + strings.Join(meta.Creators, ", ")
 	}
 
 	detail += " · Коллекция: " + collection
@@ -247,11 +272,38 @@ func descriptionHead(d string) string {
 	return strings.TrimRight(head, " ")
 }
 
+// printManualDryMeta echoes the batch metadata in a manual-mode (no
+// --auto-meta) dry-run: Название, Описание and Темы as dim lines after
+// the Загрузить line, mirroring the auto-meta detail formatting. Each
+// line renders only when the value is set.
+func printManualDryMeta(con *console.Console, o ias3.HeaderOpts) {
+	if o.Title != "" {
+		con.Dimf("    Название: «%s»", o.Title)
+	}
+
+	if head := descriptionHead(o.Description); head != "" {
+		con.Dimf("    Описание: %s", head)
+	}
+
+	if subjects := o.Extra["subject"]; len(subjects) > 0 {
+		con.Dimf("    Темы: %s", strings.Join(subjects, ", "))
+	}
+}
+
 // uploadAutoMetaTargets derives the targets and item metadata from the
 // PDFs themselves: pdfmeta.DeriveMeta for the metadata, pdfmeta.Identifier
-// for the dir-nn-slug scheme. Subjects/language/year land in the per-target
-// Extra; Title/Description ride the target-level overrides.
-func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
+// for the dir-nn-slug scheme. Subjects/language/year/creators land in
+// the per-target Extra (creators as a MULTI-VALUE name — the existing
+// ias3.Meta machinery numbers them x-archive-meta00-creator, ...);
+// Title/Description ride the target-level overrides.
+//
+// Explicitly passed flags OVERRIDE the derived values per parameter
+// (owner fix batch): opts.Title/opts.Description replace the derived
+// fields, and every --meta name wins entirely for that name (the derived
+// values for the name are dropped) while derived names not mentioned
+// stay. The fold happens on the meta itself so the dry-run review
+// surface shows the final values.
+func uploadAutoMetaTargets(paths []string, opts ias3.HeaderOpts, creatorSrc pdfmeta.CreatorSource) ([]runner.UploadTarget, []pdfmeta.Meta, error) {
 	targets := make([]runner.UploadTarget, 0, len(paths))
 	metas := make([]pdfmeta.Meta, 0, len(paths))
 	seenIDs := make(map[string]string, len(paths)) // identifier → first path
@@ -264,7 +316,7 @@ func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Met
 
 		dirName := filepath.Base(filepath.Dir(abs))
 
-		meta, err := pdfmeta.DeriveMeta(abs, dirName)
+		meta, err := pdfmeta.DeriveMeta(abs, dirName, creatorSrc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -280,21 +332,34 @@ func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Met
 
 		seenIDs[id] = abs
 
-		extra := ias3.Meta{}
-		if len(meta.Subjects) > 0 {
-			extra["subject"] = meta.Subjects
+		// Explicit flag metadata overrides the derivation per parameter.
+		if opts.Title != "" {
+			meta.Title = opts.Title
 		}
 
-		if meta.Language != "" {
-			extra["language"] = []string{meta.Language}
+		if opts.Description != "" {
+			meta.Description = opts.Description
 		}
 
-		if meta.Year != "" {
-			extra["year"] = []string{meta.Year}
+		if v := opts.Extra["subject"]; len(v) > 0 {
+			meta.Subjects = v
 		}
 
-		if meta.Creator != "" {
-			extra["creator"] = []string{meta.Creator}
+		if v := opts.Extra["language"]; len(v) > 0 {
+			meta.Language = strings.Join(v, ", ")
+		}
+
+		if v := opts.Extra["year"]; len(v) > 0 {
+			meta.Year = strings.Join(v, ", ")
+		}
+
+		if v := opts.Extra["creator"]; len(v) > 0 {
+			meta.Creators = v
+		}
+
+		extra := derivedExtra(meta)
+		for name, values := range opts.Extra {
+			extra[name] = values // an explicit name wins entirely for that name
 		}
 
 		targets = append(targets, runner.UploadTarget{
@@ -309,6 +374,30 @@ func uploadAutoMetaTargets(paths []string) ([]runner.UploadTarget, []pdfmeta.Met
 	}
 
 	return targets, metas, nil
+}
+
+// derivedExtra builds the Extra surface of one derived meta: subjects,
+// language, year and the multi-value creators. Empty fields are omitted
+// (a degenerate description never rides an empty header).
+func derivedExtra(meta pdfmeta.Meta) ias3.Meta {
+	extra := ias3.Meta{}
+	if len(meta.Subjects) > 0 {
+		extra["subject"] = meta.Subjects
+	}
+
+	if meta.Language != "" {
+		extra["language"] = []string{meta.Language}
+	}
+
+	if meta.Year != "" {
+		extra["year"] = []string{meta.Year}
+	}
+
+	if len(meta.Creators) > 0 {
+		extra["creator"] = meta.Creators
+	}
+
+	return extra
 }
 
 // headerOptsFrom builds the IA-S3 header surface from configuration and
@@ -392,11 +481,13 @@ func NewUploadCommand(configPath, journalPath *string, jsonOut, noColor, dryRun 
 	fs.BoolVar(&f.waitDerive, "wait-derive", false, "дождаться завершения деривации (включает постановку деривации в очередь)")
 	fs.BoolVar(&f.checksumSkip, "checksum-skip", false, "не пропускать файлы, уже присутствующие в элементе с тем же MD5")
 	fs.StringVar(&f.identifierFrom, "identifier-from", "",
-		"шаблон идентификатора для каждого файла, например \"custom-{{.Base}}\" (взаимоисключим с --item)")
+		"шаблон идентификатора для каждого файла, например \"custom-{{.Base}}\" или \"papers-{{.BaseNoExt}}\" (взаимоисключим с --item)")
 	fs.BoolVar(&f.autoMeta, "auto-meta", false,
 		"вывести метаданные каждого PDF из самого файла (pdfinfo/pdftotext, poppler-utils): название, автор, год, описание, темы, язык; требует poppler-utils и имена вида NN_автор_тема.pdf")
 	fs.StringVar(&f.identifierScheme, "identifier-scheme", "",
 		"схема идентификаторов при --auto-meta, единственное значение dir-nn-slug: <каталог>-<номер>-<имя-файла>")
+	fs.StringVar(&f.creatorSource, "creator-source", "",
+		"источник значений creator при --auto-meta: file — автор из имени файла (по умолчанию), pdf — Author из PDF, both — оба значения")
 
 	return cmd
 }
@@ -465,14 +556,19 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 
 	var derived []pdfmeta.Meta
 	if f.autoMeta {
-		targets, derived, err = deriveAutoMetaTargets(con, rawPaths, jsonOut)
+		targets, derived, err = deriveAutoMetaTargets(con, rawPaths, jsonOut, opts, f.creatorSource)
 		if err != nil {
 			return err
 		}
+		// The explicit flag metadata (title/description/--meta) has been
+		// folded into the per-target values above; the batch surface must
+		// not carry it too — the runner appends batch Extra values after
+		// the target's, which would duplicate every override on the wire.
+		opts.Title, opts.Description, opts.Extra = "", "", nil
 	}
 
 	if dryRun {
-		return runUploadDry(con, journalFlag, targets, derived, cfg.Upload.Collection)
+		return runUploadDry(con, journalFlag, targets, derived, opts)
 	}
 
 	jp, err := journalPathOr(journalFlag)
@@ -523,9 +619,10 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 
 // runUploadDry resolves targets and journal skips without touching the
 // network or creating the journal file. With --auto-meta the derived plan
-// shows identifier, title, collection and language per file — the review
+// shows identifier, title, collection and language per file; in manual
+// mode the batch metadata echoes after the Загрузить line — the review
 // surface the owner inspects before a live run.
-func runUploadDry(con *console.Console, journalFlag string, targets []runner.UploadTarget, derived []pdfmeta.Meta, collection string) error {
+func runUploadDry(con *console.Console, journalFlag string, targets []runner.UploadTarget, derived []pdfmeta.Meta, opts ias3.HeaderOpts) error {
 	jp, err := journalPathOr(journalFlag)
 	if err != nil {
 		return err
@@ -552,7 +649,9 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 		con.Infof("Загрузить: %s → %s/%s", t.Path, t.Identifier, t.Key)
 
 		if idx < len(derived) {
-			printDryRunDetail(con, derived[idx], collection)
+			printDryRunDetail(con, derived[idx], opts.Collection)
+		} else {
+			printManualDryMeta(con, opts)
 		}
 	}
 

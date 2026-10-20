@@ -55,12 +55,41 @@ type Info struct {
 
 // Meta is the derived archive.org item metadata for one PDF.
 type Meta struct {
-	Title       string   // PDF Title, else a filename-derived human string
-	Creator     string   // filename author segment (+ PDF Author when present and distinct)
+	Title       string   // PDF Title (junk titles fall back to the topic phrase), else filename-derived
+	Creators    []string // creator values per the CreatorSource selection
 	Year        string   // CreationDate year, empty when undetectable
-	Description string   // first ~500 chars of first-page text, whitespace-collapsed
+	Description string   // first ~500 chars of first-page text, whitespace-collapsed; empty when degenerate
 	Subjects    []string // parent dir name + filename topic words
 	Language    string   // "rus"/"eng" heuristic over first-page text, empty when mixed
+}
+
+// CreatorSource selects which author surfaces feed the derived creator
+// values (the --creator-source flag, default file).
+type CreatorSource string
+
+const (
+	// CreatorSourceFile uses the filename author segment only (default).
+	CreatorSourceFile CreatorSource = "file"
+	// CreatorSourcePDF uses the PDF Author field only.
+	CreatorSourcePDF CreatorSource = "pdf"
+	// CreatorSourceBoth uses the filename author first, then the PDF
+	// Author as a distinct value (case-insensitive duplicates collapse).
+	CreatorSourceBoth CreatorSource = "both"
+)
+
+// ParseCreatorSource parses the --creator-source flag value; the empty
+// string means the documented default (file).
+func ParseCreatorSource(s string) (CreatorSource, error) {
+	switch CreatorSource(s) {
+	case "", CreatorSourceFile:
+		return CreatorSourceFile, nil
+	case CreatorSourcePDF:
+		return CreatorSourcePDF, nil
+	case CreatorSourceBoth:
+		return CreatorSourceBoth, nil
+	default:
+		return "", fmt.Errorf("недопустимое значение --creator-source: %q — ожидается file, pdf или both", s)
+	}
 }
 
 // yearRe extracts the first 19xx/20xx year from a pdfinfo date line
@@ -217,8 +246,9 @@ func truncateRunes(s string, limit int) string {
 // DeriveMeta derives the full item metadata for one PDF: document info,
 // first-page text and the filename convention NN_author_topic_words.pdf
 // (NN = mandatory leading number, author = second segment, the rest = topic
-// words). dirName is the parent directory name feeding the subjects.
-func DeriveMeta(path string, dirName string) (Meta, error) {
+// words). dirName is the parent directory name feeding the subjects;
+// creatorSrc selects the creator values (--creator-source).
+func DeriveMeta(path string, dirName string, creatorSrc CreatorSource) (Meta, error) {
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 
@@ -251,14 +281,9 @@ func DeriveMeta(path string, dirName string) (Meta, error) {
 		return Meta{}, err
 	}
 
-	title := info.Title
-	if title == "" {
-		title = humanFromFilename(author, topicWords)
-	}
-
 	m := Meta{
-		Title:       title,
-		Creator:     joinCreators(author, info.Author),
+		Title:       deriveTitle(info.Title, author, topicWords),
+		Creators:    creatorsFor(author, info.Author, creatorSrc),
 		Year:        extractYear(info.CreationDate),
 		Description: truncateRunes(full, descriptionMaxChars),
 		Subjects:    append([]string{dirName}, strings.Join(topicWords, " ")),
@@ -272,62 +297,128 @@ func DeriveMeta(path string, dirName string) (Meta, error) {
 	return m, nil
 }
 
-// humanFromFilename renders the post-number filename as a human title:
-// segments joined with spaces, every word's first letter uppercased.
-func humanFromFilename(author string, topicWords []string) string {
-	words := topicWords
-	if author != "" {
-		words = append([]string{author}, topicWords...)
-	}
+// msWordTitlePrefix is the layout-tool prefix marking a Word-embedded
+// title; matched case-insensitively (all-ASCII, so the byte length is
+// case-stable).
+const msWordTitlePrefix = "microsoft word - "
 
-	var b strings.Builder
+// hexBlobTitleRe matches hex placeholder titles (InDesign/Quark export
+// leaks) like <E2E5F1F2EDE8EA5FE3F3EC31342E696E6464> — 16+ hex digits
+// with an optional <> wrapper on each side.
+var hexBlobTitleRe = regexp.MustCompile(`^[<>]?[0-9a-fA-F]{16,}[<>]?$`)
 
-	for idx, word := range words {
-		if idx > 0 {
-			b.WriteByte(' ')
+// junkTitleExts are layout/source-tool extensions that mark the PDF Title
+// as a filename leak rather than a real title (matched case-insensitively
+// on the title's end).
+var junkTitleExts = []string{".indb", ".indd", ".qxd", ".docx", ".doc", ".pptx", ".wpd"}
+
+// deriveTitle applies the owner's garbage-title rules: a PDF-embedded
+// Title that is a hex placeholder, a layout/source filename leak, or
+// empty/whitespace is junk and falls back to the humanized topic phrase.
+// A "Microsoft Word - " prefix is stripped first (underscores→spaces,
+// trimmed); a remainder of at least 4 chars becomes the title AS-IS
+// (case preserved), anything shorter falls back.
+func deriveTitle(pdfTitle, author string, topicWords []string) string {
+	title := strings.TrimSpace(pdfTitle)
+
+	if strings.HasPrefix(strings.ToLower(title), msWordTitlePrefix) {
+		rest := strings.TrimSpace(strings.ReplaceAll(title[len(msWordTitlePrefix):], "_", " "))
+		// The remainder must ALSO clear the junk rules: a source-file
+		// leak like "Document1.doc" is junk at any length (round-4 🟡).
+		if utf8.RuneCountInString(rest) >= 4 && !isJunkTitle(rest) {
+			return rest
 		}
 
-		first, size := utf8.DecodeRuneInString(word)
-		if first == utf8.RuneError && size <= 1 {
-			b.WriteString(word)
-
-			continue
-		}
-
-		b.WriteString(string(unicode.ToUpper(first)))
-		b.WriteString(word[size:])
+		// A degenerate remainder is junk like any other.
+		title = ""
 	}
 
-	return b.String()
+	if isJunkTitle(title) {
+		return humanizedTopicPhrase(author, topicWords)
+	}
+
+	return title
 }
 
-// joinCreators merges the filename author segment with the PDF Author,
-// skipping duplicates (case-insensitive) and empty parts.
-func joinCreators(parts ...string) string {
-	var seen []string
+// isJunkTitle reports whether the (trimmed) title is garbage: empty, a
+// hex placeholder, or a layout/source filename leak.
+func isJunkTitle(title string) bool {
+	if title == "" {
+		return true
+	}
 
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
+	if hexBlobTitleRe.MatchString(title) {
+		return true
+	}
+
+	lower := strings.ToLower(title)
+	for _, ext := range junkTitleExts {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// humanizedTopicPhrase renders the filename fallback title: the topic
+// phrase with underscores (already split) and hyphens turned into single
+// spaces and the phrase's first letter uppercased. A file without topic
+// words degenerates to the author segment (the author is validated
+// non-empty), so the fallback title is never empty.
+func humanizedTopicPhrase(author string, topicWords []string) string {
+	words := topicWords
+	if len(words) == 0 {
+		words = []string{author}
+	}
+
+	phrase := strings.Join(strings.Fields(strings.ReplaceAll(strings.Join(words, " "), "-", " ")), " ")
+	if phrase == "" {
+		return ""
+	}
+
+	first, size := utf8.DecodeRuneInString(phrase)
+	if first == utf8.RuneError && size <= 1 {
+		return phrase
+	}
+
+	return string(unicode.ToUpper(first)) + phrase[size:]
+}
+
+// creatorsFor builds the creator values per the --creator-source
+// selection: file = filename author only (default), pdf = PDF Author
+// only, both = file author first then the PDF Author as distinct values
+// (case-insensitive duplicates collapse; empty parts never emit).
+func creatorsFor(fileAuthor, pdfAuthor string, creatorSrc CreatorSource) []string {
+	fileAuthor, pdfAuthor = strings.TrimSpace(fileAuthor), strings.TrimSpace(pdfAuthor)
+
+	var out []string
+
+	add := func(v string) {
+		if v == "" {
+			return
 		}
 
-		dup := false
-
-		for _, s := range seen {
-			if strings.EqualFold(s, p) {
-				dup = true
-
-				break
+		for _, seen := range out {
+			if strings.EqualFold(seen, v) {
+				return
 			}
 		}
 
-		if !dup {
-			seen = append(seen, p)
-		}
+		out = append(out, v)
 	}
 
-	return strings.Join(seen, ", ")
+	switch creatorSrc {
+	case CreatorSourcePDF:
+		add(pdfAuthor)
+	case CreatorSourceBoth:
+		add(fileAuthor)
+		add(pdfAuthor)
+	default: // CreatorSourceFile
+		add(fileAuthor)
+	}
+
+	return out
 }
 
 // extractYear pulls the first 19xx/20xx year out of a pdfinfo date.

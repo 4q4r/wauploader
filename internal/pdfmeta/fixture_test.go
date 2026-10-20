@@ -81,10 +81,10 @@ func TestRealPopplerExtractDeriveAndText(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, text, "quick brown fox")
 
-	m, err := DeriveMeta(path, "fixtures")
+	m, err := DeriveMeta(path, "fixtures", CreatorSourceBoth)
 	require.NoError(t, err)
 	require.Equal(t, "Fixture Title", m.Title)
-	require.Equal(t, "fixture, Fixture Author", m.Creator)
+	require.Equal(t, []string{"fixture", "Fixture Author"}, m.Creators)
 	require.Equal(t, "2022", m.Year)
 	require.Equal(t, []string{"fixtures", "author topic"}, m.Subjects)
 	require.Equal(t, "eng", m.Language)
