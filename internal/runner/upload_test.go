@@ -321,9 +321,9 @@ func uploadTargets(paths []string, identifier string) []UploadTarget {
 	return out
 }
 
-func runUploadAll(t *testing.T, ctx context.Context, r *UploadRunner, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting bool) ([]Event, Summary, error) {
+func runUploadAll(t *testing.T, ctx context.Context, r *UploadRunner, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting, waitDerive bool) ([]Event, Summary, error) {
 	t.Helper()
-	events, done := r.Run(ctx, targets, o, verify, skipExisting)
+	events, done := r.Run(ctx, targets, o, verify, skipExisting, waitDerive)
 	var got []Event
 	for ev := range events {
 		got = append(got, ev)
@@ -433,7 +433,7 @@ func TestSinglePassHashing(t *testing.T) {
 	f := newFakeIAS3(t)
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 	tgts := uploadTargets([]string{path}, "testid-upload-1")
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum.Done)
 	rec := mustUploadRecord(t, st, tgts[0])
@@ -476,7 +476,7 @@ func TestItemFileOrderSequential(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-sequen1")
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	assert.Equal(t, 3, sum.Done)
 
@@ -502,7 +502,7 @@ func TestParallelAcrossItems(t *testing.T) {
 		{Path: p1[0], Identifier: "testid-parallela"},
 		{Path: p2[0], Identifier: "testid-parallelb"},
 	}
-	_, sum, err := runUploadAll(t, context.Background(), r, targets, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, targets, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	assert.Equal(t, 2, sum.Done)
 	assert.GreaterOrEqual(t, f.maxTotalInflight(), 2, "distinct items must upload in parallel")
@@ -518,7 +518,7 @@ func TestSkipExistingByMD5(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-skipexis1")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, true)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, true, false)
 	require.NoError(t, err)
 	assert.Equal(t, 1, sum.Skipped)
 	assert.Equal(t, 0, sum.Done)
@@ -552,7 +552,7 @@ func TestFailedFileRestartsFromZeroOthersKept(t *testing.T) {
 	tgts := uploadTargets(paths, "testid-restart01")
 
 	// Run 1: file2 fails, siblings keep going.
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	assert.Equal(t, 2, sum.Done)
 	assert.Equal(t, 1, sum.Failed)
@@ -564,7 +564,7 @@ func TestFailedFileRestartsFromZeroOthersKept(t *testing.T) {
 
 	// Run 2: only the failed file re-uploads, whole content from byte 0.
 	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
-	got, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), false, false)
+	got, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	assert.Equal(t, 1, sum2.Done)
 	assert.Equal(t, 2, sum2.Skipped)
@@ -595,7 +595,7 @@ func TestSizeHintOnFirstPUTOnly(t *testing.T) {
 	r, _ := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-sizehint1")
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 3, sum.Done)
 
@@ -621,7 +621,7 @@ func TestQueueDeriveFalseExceptLast(t *testing.T) {
 	r, _ := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-qderivel1")
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, true)
 	require.NoError(t, err)
 	require.Equal(t, 3, sum.Done)
 
@@ -656,7 +656,7 @@ func TestProgressCallbackCounts(t *testing.T) {
 	f := newFakeIAS3(t)
 	r, _ := newTestUploadRunner(t, f, uploadTestLimits())
 	tgts := uploadTargets(paths, "testid-progress1")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum.Done)
 
@@ -692,7 +692,7 @@ func TestDeriveWatchPerItemAfterLast(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-derivewt1")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, true)
 	require.NoError(t, err) // per-file failures are journaled, never fatal
 	assert.Equal(t, 2, sum.Done, "files stay done — derive is item-level")
 	assert.Equal(t, 1, sum.Failed, "the item-level derive failure counts once")
@@ -724,7 +724,7 @@ func TestCheckLimitOutageFailsFileWithoutPUT(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-prefligh1")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err) // per-file failures are journaled, never fatal
 	assert.Equal(t, 0, f.puts("file1.bin"), "a stalled-queue preflight must never admit a PUT")
 	assert.GreaterOrEqual(t, f.checkCount(), 1, "the preflight must actually poll the endpoint")
@@ -757,7 +757,7 @@ func TestDeriveWatchNotArmedWhenLastFileFails(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-derivenot1")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, true)
 	require.NoError(t, err)
 	assert.Equal(t, 1, sum.Done)
 	assert.Equal(t, 1, sum.Failed)
@@ -782,7 +782,7 @@ func TestDeriveWatchNotArmedWhenLastFileSkipped(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-derivenot2")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, true)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, true, true)
 	require.NoError(t, err)
 	assert.Equal(t, 1, sum.Done)
 	assert.Equal(t, 1, sum.Skipped)
@@ -813,7 +813,7 @@ func TestSkipGuardTasksActiveUploadsAnyway(t *testing.T) {
 	tgts := uploadTargets(paths, "testid-skipguard1")
 	o := uploadOpts()
 	o.QueueDerive = false // the guard is independent of derive watching
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, o, false, true)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, o, false, true, false)
 	require.NoError(t, err)
 	assert.Equal(t, 1, sum.Done)
 	assert.Equal(t, 0, sum.Skipped, "an active-task item must not produce a skip")
@@ -844,7 +844,7 @@ func TestSkipGuardTasksErrorFailsRetryable(t *testing.T) {
 	tgts := uploadTargets(paths, "testid-skipguard2")
 	o := uploadOpts()
 	o.QueueDerive = false
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, o, false, true)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, o, false, true, false)
 	require.NoError(t, err)
 	assert.Equal(t, 0, f.puts("file1.bin"), "an undecidable skip must not PUT")
 	assert.Equal(t, 1, sum.Failed)
@@ -869,7 +869,7 @@ func TestDeriveWatchSurvivesVerifyFailure(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-derivewt2")
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), true, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), true, false, true)
 	require.NoError(t, err)
 	assert.Equal(t, 0, sum.Done)
 	assert.Equal(t, 1, sum.Failed)
@@ -877,6 +877,42 @@ func TestDeriveWatchSurvivesVerifyFailure(t *testing.T) {
 	// Baseline capture + the (successful) watch prove the watch ran
 	// even though the file failed at verify.
 	assert.Equal(t, 2, f.taskCalls("testid-derivewt2"))
+}
+
+// TestDeriveWatchOffWithoutFlag: the derive watch runs only when the
+// caller asks for it (the --wait-derive flag). With waitDerive=false a
+// successfully ARMED derive (the last PUT carried QueueDerive=true)
+// must NOT be waited on: the Tasks API is touched for the baseline
+// capture only, the batch ends promptly with no item-level failure and
+// no derive-wait event, even though a poll would have found a stuck
+// derive.
+func TestDeriveWatchOffWithoutFlag(t *testing.T) {
+	paths := writeUploadFiles(t, "nowait1", "nowait2")
+	f := newFakeIAS3(t)
+	f.taskFn = func(identifier string, nth int) string {
+		if nth == 1 {
+			// Baseline capture: an old finished derive.
+			return `{"success":true,"value":{"catalog":[],"history":[{"task_id":10,"cmd":"derive.php"}]}}`
+		}
+		// A watch poll would see a stuck derive and eventually fail
+		// the item — proof the watch did not run.
+		return `{"success":true,"value":{"catalog":[{"task_id":77,"cmd":"derive.php","wait_admin":2}],"history":[]}}`
+	}
+	r, st := newTestUploadRunner(t, f, uploadTestLimits())
+
+	tgts := uploadTargets(paths, "testid-derivenowt")
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, sum.Done, "files upload as usual")
+	assert.Equal(t, 0, sum.Failed, "no item-level derive failure without waitDerive")
+	for _, tgt := range tgts {
+		assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgt).State)
+	}
+	assert.Equal(t, 1, f.taskCalls("testid-derivenowt"),
+		"baseline only: the derive was queued but the watch must not run without waitDerive")
+	for _, ev := range got {
+		assert.NotContains(t, ev.ErrMsg, "ожидание деривации", "no derive-wait event without waitDerive")
+	}
 }
 
 // TestBadCredentialsPausesQueue: a credentials refusal journals the file
@@ -891,7 +927,7 @@ func TestBadCredentialsPausesQueue(t *testing.T) {
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
 
 	tgts := uploadTargets(paths, "testid-badcreds1")
-	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	got, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.Error(t, err, "an auth pause must surface as the completion error")
 	assert.Contains(t, err.Error(), "авторизации")
 	assert.Equal(t, 1, f.puts("file1.bin"), "the queue stops after the first credential refusal")
@@ -930,7 +966,7 @@ func TestCancelMidUploadLeavesQueuedAndResumes(t *testing.T) {
 			2*time.Second, 2*time.Millisecond, "the PUT must start before the cancel")
 		cancel()
 	}()
-	got, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), false, false)
+	got, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), false, false, false)
 	<-canceler
 	require.ErrorIs(t, err, context.Canceled, "a cancelled run surfaces as the completion error")
 
@@ -947,7 +983,7 @@ func TestCancelMidUploadLeavesQueuedAndResumes(t *testing.T) {
 	// The next run's resume scan picks the queued record up and finishes it.
 	f.setBlockPutUntilCancel(false)
 	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
-	_, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
@@ -972,7 +1008,7 @@ func TestCancelMidVerifyLeavesQueuedAndResumes(t *testing.T) {
 			2*time.Second, 2*time.Millisecond, "verify must reach the metadata API (PUT already done)")
 		cancel()
 	}()
-	_, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), true /* verify */, false)
+	_, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), true /* verify */, false, false)
 	<-canceler
 	require.ErrorIs(t, err, context.Canceled)
 
@@ -986,7 +1022,7 @@ func TestCancelMidVerifyLeavesQueuedAndResumes(t *testing.T) {
 	sum5 := md5.Sum([]byte("verify-interrupt"))
 	f.metaFiles["testid-cancelver1"] = []metaEntry{{name: "file1.bin", md5: hex.EncodeToString(sum5[:])}}
 	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
-	_, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), true, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, tgts, uploadOpts(), true, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 	assert.Equal(t, journal.StateDone, mustUploadRecord(t, st, tgts[0]).State)
