@@ -46,8 +46,22 @@ func shrinkPacing(t *testing.T) {
 	t.Cleanup(func() { slowDownWait, CheckLimitPoll = oldSleep, oldPoll })
 }
 
-// --- ValidateIdentifier -------------------------------------------------
+// --- fileURL ------------------------------------------------------------
 
+// TestFileURLNestedKey: a nested key ("photos/a b.jpg") keeps its "/"
+// separators on the wire — the reference client does the same (urllib
+// quote with the default safe="/"), so archive.org stores the key with
+// its directory structure. Every segment is still percent-escaped.
+func TestFileURLNestedKey(t *testing.T) {
+	cl := &Client{base: "https://s3.example.org"}
+
+	assert.Equal(t, "https://s3.example.org/my-item/plain.txt", cl.fileURL("my-item", "plain.txt"))
+	assert.Equal(t, "https://s3.example.org/my-item/photos/a%20b.jpg", cl.fileURL("my-item", "photos/a b.jpg"))
+	assert.Equal(t, "https://s3.example.org/my-item/sub/dir/file.txt", cl.fileURL("my-item", "sub/dir/file.txt"))
+	assert.Equal(t, "https://s3.example.org/my-item/a%3Fb.txt", cl.fileURL("my-item", "a?b.txt"))
+}
+
+// --- ValidateIdentifier -------------------------------------------------
 func TestValidateIdentifierRules(t *testing.T) {
 	valid := []string{"abcde", "a-b.c_d1", "12345", strings.Repeat("a", 80)}
 	for _, id := range valid {
