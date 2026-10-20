@@ -195,3 +195,17 @@
 - `firefox-vpn-client/` — сторонний код (Mullvad).
 - Клиентские ZIP (`*ozon*.zip`, `marketplace-card-master-ozon-br63.zip`, `zayavi_полный_пакет_2026-08-24.zip`, `КОРОБИЛОВ.zip`).
 - `.bash_history`, `.pki`, `.config`, `.venv`, `.git` — служебное/секреты, не трогаем.
+
+## 5. Загружено 2026-10-20 (live на archive.org)
+
+| Item | Что | Коллекция |
+| :-- | :-- | :-- |
+| `athens-1…8`, `sparta-1…6` | 14 статей из ~/articles (Афины/Спарта) | opensource / texts |
+| `wordstat-evakuator-results-2026` | 91 файл датасета Wordstat (дерево сохранено) | opensource_media / data |
+| `intrieri-philia-interstatale-isocrate-2021` | Intrieri M., «La philia interstatale…» (Hormos 13, 2021) | opensource / texts |
+| `gomez-mendoza-deporte-universitario-uaemex-2023` | Gómez Mendoza P. G., «El deporte universitario en la UAEMéx…» (2023, CC BY-NC) | opensource / texts |
+| `leshkevich-filosofia-nauki-2001` | Лешкевич Т. Г., «Философия науки: традиции и новации» (2001, 837 стр.) | opensource / texts |
+| `moelcnik-frauenrollen-sparta-athen-2021` | Mölčnik M., Masterarbeit «Die propagierte Andersartigkeit der Frauen Spartas…» (2021) | opensource / texts |
+| `levy-remarques-preliminaires-education-spartiate-1997` | Lévy E., «Remarques préliminaires sur l'éducation spartiate» (Ktèma 22, 1997) | opensource / texts |
+
+Не загружено сознательно: личные/клиентские/учётные документы (резюме, накладные, чеки, 2FAS-датакит, SEO-отчёт), `.bash_history`/`.pki`/`.config`/`.venv`, `NGE_4K_Merged` (82 ГБ, права + нет resume).
