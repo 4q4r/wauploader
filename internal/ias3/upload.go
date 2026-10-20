@@ -63,7 +63,7 @@ var (
 // UploadRequest describes one file PUT.
 type UploadRequest struct {
 	Identifier string // item (S3 bucket) name; validated with ValidateIdentifier
-	Key        string // file name inside the item (flat, no slashes)
+	Key        string // file name inside the item ("dir/file.txt" keeps the tree)
 	Path       string // local file to read
 	Size       int64  // declared size in bytes; <= 0 falls back to os.Stat
 	MD5Hex     string // optional Content-MD5 hex digest (IA accepts hex, r2 §2.3)
@@ -103,10 +103,25 @@ func (c *Client) setAuth(req *http.Request) {
 	req.Header.Set("Authorization", "LOW "+c.creds.Access+":"+c.creds.Secret)
 }
 
-// fileURL builds the PUT target <base>/<identifier>/<key>. Both segments
-// are percent-escaped; IA-S3 keys are flat file names.
+// fileURL builds the PUT target <base>/<identifier>/<key>. The identifier
+// and every key SEGMENT are percent-escaped; the "/" that separates the
+// segments stays literal, so a nested key ("photos/a.jpg") addresses the
+// nested path — the reference client does the same (urllib quote with the
+// default safe="/", internetarchive/item.py), and archive.org stores the
+// key with its directory structure.
 func (c *Client) fileURL(identifier, key string) string {
-	return c.base + "/" + url.PathEscape(identifier) + "/" + url.PathEscape(key)
+	return c.base + "/" + url.PathEscape(identifier) + "/" + escapeKeyPath(key)
+}
+
+// escapeKeyPath percent-escapes each segment of an S3 key, keeping the
+// "/" separators literal.
+func escapeKeyPath(key string) string {
+	segments := strings.Split(key, "/")
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+
+	return strings.Join(segments, "/")
 }
 
 // --- Overload preflight ---------------------------------------------------

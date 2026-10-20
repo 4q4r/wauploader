@@ -53,6 +53,7 @@ type fakeIAS3 struct {
 	inflightTotal    int
 	maxInflightTotal int
 	putSeq           []string // global PUT start order
+	putIDs           []string // the item identifier of every PUT, in order
 	metaCalls        int
 	metaFiles        map[string][]metaEntry // per identifier
 	taskCallsByID    map[string]int
@@ -93,7 +94,9 @@ func newFakeIAS3(t *testing.T) *fakeIAS3 {
 		taskCallsByID:   map[string]int{},
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /{id}/{key}", f.handlePut)
+	// The key wildcard spans the rest of the path: a nested key
+	// ("sub/dir/file.txt") addresses the nested path in ONE item.
+	mux.HandleFunc("PUT /{id}/{key...}", f.handlePut)
 	mux.HandleFunc("GET /metadata/{id}", f.handleMeta)
 	mux.HandleFunc("GET /services/tasks.php", f.handleTasks)
 	mux.HandleFunc("/", f.handleRoot) // check_limit=1 preflight
@@ -118,6 +121,7 @@ func (f *fakeIAS3) handlePut(w http.ResponseWriter, r *http.Request) {
 		f.maxInflightTotal = f.inflightTotal
 	}
 	f.putSeq = append(f.putSeq, key)
+	f.putIDs = append(f.putIDs, id)
 	f.mu.Unlock()
 	defer func() {
 		f.mu.Lock()
@@ -376,6 +380,13 @@ func (f *fakeIAS3) sequence() []string {
 	return append([]string(nil), f.putSeq...)
 }
 
+// putIdentifiers returns the item identifier of every PUT, in order.
+func (f *fakeIAS3) putIdentifiers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.putIDs...)
+}
+
 func (f *fakeIAS3) taskCalls(id string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -631,6 +642,56 @@ func TestQueueDeriveFalseExceptLast(t *testing.T) {
 
 	// The derive watch ran per item: baseline capture + completion poll.
 	assert.Equal(t, 2, f.taskCalls("testid-qderivel1"))
+}
+
+// TestOneItemTreeFiles: a whole tree (nested keys) uploaded as ONE item —
+// every PUT goes to the same identifier, the first one creates the item
+// and carries the size hint of ALL the files, and only the last PUT
+// queues the derive.
+func TestOneItemTreeFiles(t *testing.T) {
+	dir := t.TempDir()
+	// An ORDERED list: the first file of the item bootstraps it, and the
+	// last one queues the derive.
+	tree := []struct {
+		key  string
+		body string
+	}{
+		{"a.json", "{}"},
+		{"sub/b.json", "{}"},
+		{"sub/deep/c.txt", "x"},
+	}
+
+	tgts := make([]UploadTarget, 0, len(tree))
+	for _, file := range tree {
+		p := filepath.Join(dir, filepath.FromSlash(file.key))
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(file.body), 0o600))
+		tgts = append(tgts, UploadTarget{Path: p, Identifier: "testid-treeitem1", Key: file.key})
+	}
+
+	f := newFakeIAS3(t)
+	r, _ := newTestUploadRunner(t, f, uploadTestLimits())
+
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, true)
+	require.NoError(t, err)
+	require.Equal(t, 3, sum.Done)
+
+	assert.Equal(t, []string{"testid-treeitem1", "testid-treeitem1", "testid-treeitem1"},
+		f.putIdentifiers(), "every file of the tree goes into ONE item")
+
+	// The first PUT of the item creates it and carries the whole-item
+	// size hint (2 + 2 + 1 bytes).
+	first := f.headers("a.json")
+	assert.Equal(t, "1", first.Get("x-archive-auto-make-bucket"), "the first PUT creates the item")
+	assert.Equal(t, "5", first.Get("x-archive-size-hint"), "the size hint is the sum of the whole tree")
+	assert.Equal(t, "0", first.Get("x-archive-queue-derive"))
+
+	// Only the last PUT of the item queues the derive.
+	assert.Equal(t, "0", f.headers("sub/b.json").Get("x-archive-queue-derive"))
+	assert.Equal(t, "1", f.headers("sub/deep/c.txt").Get("x-archive-queue-derive"),
+		"only the last file of the tree queues the derive")
+	assert.Empty(t, f.headers("sub/b.json").Get("x-archive-size-hint"),
+		"only the first PUT of the item carries the size hint")
 }
 
 // TestProgressCallbackCounts: PUT progress reaches the event stream
