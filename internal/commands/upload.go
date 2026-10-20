@@ -405,10 +405,11 @@ func derivedExtra(meta pdfmeta.Meta) ias3.Meta {
 // flags and validated); the control booleans combine the configuration
 // defaults with the flag overrides; --meta pairs land in Extra.
 //
-// Derive wiring (Task 11 report, binding): the runner's derive watch is
-// armed by a PUT actually carrying QueueDerive=true, so --no-derive turns
-// both queueing and watching off, while --wait-derive forces queueing on
-// (overriding a config queue_derive=false) and thereby the watch.
+// Derive wiring: --wait-derive forces queueing on (overriding a config
+// queue_derive=false) and is passed to the runner as the derive-watch
+// gate — without the flag the tool queues the derive but never waits.
+// --no-derive turns queueing off; contradicting it with --wait-derive
+// is a usage error.
 func headerOptsFrom(cfg *config.Config, f *uploadFlags) (ias3.HeaderOpts, error) {
 	meta, err := parseMetaFlags(f.meta)
 	if err != nil {
@@ -601,7 +602,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	cl := ias3.NewClient(newHTTPClient(), creds)
 	r := runner.NewUploadRunner(cl, st, lim, runnerConsole(con, jsonOut))
 
-	events, done := r.Run(cmd.Context(), targets, opts, f.verify, !f.checksumSkip)
+	events, done := r.Run(cmd.Context(), targets, opts, f.verify, !f.checksumSkip, f.waitDerive)
 
 	var p eventPump
 	p.pumpStart(events, con, jsonOut)
