@@ -51,9 +51,10 @@
 //     behavior; metadata is idempotent). A skip-existing hit may make
 //     the SizeHint a slight overcount — it is a scheduling hint, not a
 //     contract.
-//   - Derive watch (--wait-derive semantics) is PER ITEM and tied to
-//     o.QueueDerive: with derive not queued there is nothing to wait
-//     for, and the Run signature carries no separate flag. The watch
+//   - Derive watch (--wait-derive) is PER ITEM and gated by the
+//     waitDerive argument: without it the tool never waits — the
+//     derive still lands on the IA queue via QueueDerive and the run
+//     ends as soon as the files are done. Even with the flag the watch
 //     fires only when a PUT actually carrying QueueDerive=true
 //     succeeded ("armed"): if the last file failed or skip-matched, no
 //     derive was queued and waiting would burn the JobWait budget into
@@ -213,14 +214,14 @@ func NewUploadRunner(cl *ias3.Client, st *journal.Store, lim Limits, con *consol
 // Run starts the batch over targets and returns the event stream plus a
 // completion func returning (Summary, error) — mirroring SaveRunner.
 // The stream closes when the batch ends; the caller must drain it fully.
-func (r *UploadRunner) Run(ctx context.Context, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting bool) (<-chan Event, func() (Summary, error)) {
+func (r *UploadRunner) Run(ctx context.Context, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting, waitDerive bool) (<-chan Event, func() (Summary, error)) {
 	events := make(chan Event)
 	res := &runResult{done: make(chan struct{})}
 
 	go func() {
 		defer close(events)
 
-		res.summary, res.err = r.execute(ctx, targets, o, verify, skipExisting, events)
+		res.summary, res.err = r.execute(ctx, targets, o, verify, skipExisting, waitDerive, events)
 		close(res.done)
 	}()
 
@@ -232,7 +233,7 @@ func (r *UploadRunner) Run(ctx context.Context, targets []UploadTarget, o ias3.H
 
 // execute validates limits, plans the run and fans the per-item
 // sequential chains out under the global concurrency cap.
-func (r *UploadRunner) execute(ctx context.Context, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting bool, events chan<- Event) (Summary, error) {
+func (r *UploadRunner) execute(ctx context.Context, targets []UploadTarget, o ias3.HeaderOpts, verify, skipExisting, waitDerive bool, events chan<- Event) (Summary, error) {
 	if err := r.lim.Validate(); err != nil {
 		return Summary{}, err
 	}
@@ -263,7 +264,7 @@ func (r *UploadRunner) execute(ctx context.Context, targets []UploadTarget, o ia
 		}
 
 		g.Go(func() error {
-			r.processItem(gctx, it, o, verify, skipExisting, events, c, &paused, &authOnce, &authErr)
+			r.processItem(gctx, it, o, verify, skipExisting, waitDerive, events, c, &paused, &authOnce, &authErr)
 			return nil
 		})
 	}
@@ -584,7 +585,7 @@ func (r *UploadRunner) putOptions(o ias3.HeaderOpts, it *uploadItem, f *uploadFi
 
 // processItem runs one item's sequential chain: hash → skip-if-exists →
 // preflight → PUT → verify per file, then the per-item derive watch.
-func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.HeaderOpts, verify, skipExisting bool, events chan<- Event, c *counters, paused *atomic.Bool, authOnce *sync.Once, authErr *error) { //nolint:gocognit,gocyclo // per-file state machine: preflight/skip/PUT/verify branches mirror the wire; 72 gocognit / 34 gocyclo vs caps 30/20
+func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.HeaderOpts, verify, skipExisting, waitDerive bool, events chan<- Event, c *counters, paused *atomic.Bool, authOnce *sync.Once, authErr *error) { //nolint:gocognit,gocyclo // per-file state machine: preflight/skip/PUT/verify branches mirror the wire; 72 gocognit / 34 gocyclo vs caps 30/20
 	if paused.Load() {
 		return
 	}
@@ -788,10 +789,13 @@ func (r *UploadRunner) processItem(ctx context.Context, it uploadItem, o ias3.He
 	}
 
 	// Stage 6: one derive watch per item, after the last file — only
-	// when a PUT actually carrying QueueDerive=true succeeded (armed).
-	// If the last file failed or skip-matched, no derive was queued and
-	// waiting would burn the JobWait budget into a false item failure.
-	if !deriveArmed || !haveBaseline {
+	// when the caller asked for it (waitDerive, the --wait-derive flag)
+	// AND a PUT actually carrying QueueDerive=true succeeded (armed).
+	// Without the flag the run ends here: the derive is on the IA
+	// queue, the tool does not wait for it. If the last file failed or
+	// skip-matched, no derive was queued and waiting would burn the
+	// JobWait budget into a false item failure.
+	if !deriveArmed || !waitDerive || !haveBaseline {
 		return
 	}
 

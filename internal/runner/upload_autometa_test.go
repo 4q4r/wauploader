@@ -40,7 +40,7 @@ func TestPerTargetMetaOverridesBatchHeaders(t *testing.T) {
 	o.Description = "Batch description"
 	o.Extra = ias3.Meta{"subject": {"batch-subj"}}
 
-	_, sum, err := runUploadAll(t, context.Background(), r, []UploadTarget{tgt}, o, false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, []UploadTarget{tgt}, o, false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum.Done)
 
@@ -65,7 +65,7 @@ func TestNoTargetMetaKeepsBatchHeaders(t *testing.T) {
 	o := uploadOpts()
 	o.Title = "Batch Title"
 
-	_, sum, err := runUploadAll(t, context.Background(), r, []UploadTarget{tgt}, o, false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, []UploadTarget{tgt}, o, false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum.Done)
 
@@ -98,7 +98,7 @@ func autoMetaResumeFixture(t *testing.T, title string, extra ias3.Meta) (*fakeIA
 			2*time.Second, 2*time.Millisecond, "the second PUT must start before the cancel")
 		cancel()
 	}()
-	_, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), false, false)
+	_, _, err := runUploadAll(t, ctx, r, tgts, uploadOpts(), false, false, false)
 	<-canceler
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, journal.StateQueued, mustUploadRecord(t, st, tgts[1]).State)
@@ -118,7 +118,7 @@ func TestInterruptedAutoMetaResumeCarriesJournalMeta(t *testing.T) {
 	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
 	resumed := []UploadTarget{{Path: queued[0].Path, Identifier: queued[0].Identifier, Key: queued[0].Key}}
 
-	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
@@ -146,7 +146,7 @@ func TestResumeDedupesIdenticalDerivation(t *testing.T) {
 		Extra:      ias3.Meta{"subject": {"athens", "aristophanes frogs"}},
 	}}
 
-	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
@@ -172,7 +172,7 @@ func TestResumeUnionsMixedDerivation(t *testing.T) {
 		Extra:      ias3.Meta{"subject": {"athens", "sparta"}},
 	}}
 
-	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
@@ -204,7 +204,7 @@ func TestRelistedFailedKeepsJournalTitle(t *testing.T) {
 		{Path: paths[1], Identifier: "testid-autometa4", Key: "file2.bin", Title: "Derived Title", Description: "Derived description", Extra: meta},
 	}
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum.Done)
 	require.Equal(t, journal.StateFailed, mustUploadRecord(t, st, tgts[0]).State)
@@ -212,7 +212,7 @@ func TestRelistedFailedKeepsJournalTitle(t *testing.T) {
 	// Re-list the failed file with NO fresh derivation.
 	r2 := newTestUploadRunnerOnStore(t, f, st, uploadTestLimits())
 	relisted := []UploadTarget{{Path: paths[0], Identifier: "testid-autometa4", Key: "file1.bin"}}
-	_, sum2, err := runUploadAll(t, context.Background(), r2, relisted, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, relisted, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
@@ -242,7 +242,7 @@ func TestRelistResetKeepsHeldMetaInJournal(t *testing.T) {
 		{Path: paths[1], Identifier: "testid-autometa5", Key: "file2.bin", Title: "Derived Title", Description: "Derived description", Extra: meta},
 	}
 	r, st := newTestUploadRunner(t, f, uploadTestLimits())
-	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false)
+	_, sum, err := runUploadAll(t, context.Background(), r, tgts, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum.Done)
 
@@ -262,7 +262,7 @@ func TestRelistResetKeepsHeldMetaInJournal(t *testing.T) {
 			2*time.Second, 2*time.Millisecond)
 		cancel()
 	}()
-	_, _, _ = runUploadAll(t, ctx, r2, relisted, uploadOpts(), false, false)
+	_, _, _ = runUploadAll(t, ctx, r2, relisted, uploadOpts(), false, false, false)
 	<-canceler
 
 	rec, found, err := st.Get(journal.KindUpload, uploadRecordTarget(relisted[0]))
@@ -295,7 +295,7 @@ func TestRelistExplicitFreshReplacesDerivedNames(t *testing.T) {
 		},
 	}}
 
-	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
@@ -323,7 +323,7 @@ func TestRelistedHeldNamesFillMissingFresh(t *testing.T) {
 		Extra:      ias3.Meta{"language": {"rus"}},
 	}}
 
-	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
@@ -351,7 +351,7 @@ func TestRelistedTargetPrefersFreshDerivation(t *testing.T) {
 		Extra:      ias3.Meta{"subject": {"sparta"}},
 	}}
 
-	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false)
+	_, sum2, err := runUploadAll(t, context.Background(), r2, resumed, uploadOpts(), false, false, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, sum2.Done)
 
