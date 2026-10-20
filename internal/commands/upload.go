@@ -44,6 +44,8 @@ type uploadFlags struct {
 	autoMeta                bool
 	identifierScheme        string
 	creatorSource           string
+	keyFrom                 string
+	baseDir                 string
 }
 
 // schemeDirNNSlug is the only supported --identifier-scheme value: the
@@ -136,25 +138,41 @@ func uploadTargetsFrom(paths []string, f *uploadFlags) ([]runner.UploadTarget, e
 	return targets, nil
 }
 
+// uploadTargets resolves the upload targets: the flag contract first, then
+// the per-file identifiers and keys. Every violation is a usage error
+// (exit 2).
+func uploadTargets(paths []string, f *uploadFlags) ([]runner.UploadTarget, *keyFromPlan, error) {
+	if err := uploadKeyFromContract(f); err != nil {
+		return nil, nil, err
+	}
+
+	// A directory argument expands into the files of its tree (with
+	// --key-from); without --key-from it is a usage error. The expansion
+	// happens inside the target resolution, where the GIVEN targets are
+	// still known — the base dir of the relative paths comes from them.
+	return uploadTargetsOrAutoMeta(paths, f)
+}
+
 // uploadTargetsOrAutoMeta resolves the upload targets for the two
 // identifier modes: the explicit --item/--identifier-from contract
-// (uploadTargetsFrom) or --auto-meta (targets built later from the PDFs
+// (uploadTargetsFrom), the --key-from per-file key contract
+// (uploadTargetsKeyFrom) or --auto-meta (targets built later from the PDFs
 // themselves — here only the flag contract is enforced). Every violation
 // is a usage error (exit 2).
-func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTarget, error) {
+func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTarget, *keyFromPlan, error) {
 	// The --creator-source VALUE is validated here, at the top of the
 	// contract, so a bogus value is a usage error before anything else.
 	if _, err := pdfmeta.ParseCreatorSource(f.creatorSource); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if f.identifierScheme != "" && f.identifierScheme != schemeDirNNSlug {
-		return nil, errors.New("недопустимое значение --identifier-scheme: поддерживается только dir-nn-slug")
+		return nil, nil, errors.New("недопустимое значение --identifier-scheme: поддерживается только dir-nn-slug")
 	}
 
 	if f.autoMeta {
 		if f.identifierScheme == "" {
-			return nil, errors.New("--auto-meta требует --identifier-scheme dir-nn-slug (единственная поддерживаемая схема идентификаторов)")
+			return nil, nil, errors.New("--auto-meta требует --identifier-scheme dir-nn-slug (единственная поддерживаемая схема идентификаторов)")
 		}
 
 		for _, conflict := range []struct {
@@ -163,24 +181,46 @@ func uploadTargetsOrAutoMeta(paths []string, f *uploadFlags) ([]runner.UploadTar
 			{"--item", f.item},
 			{"--identifier-from", f.identifierFrom},
 			{"--key", f.key},
+			{"--key-from", f.keyFrom},
 		} {
 			if conflict.value != "" {
-				return nil, errors.New(conflict.flag + " несовместим с --auto-meta: идентификаторы и ключи вычисляются из имён файлов")
+				return nil, nil, errors.New(conflict.flag + " несовместим с --auto-meta: идентификаторы и ключи вычисляются из имён файлов")
 			}
 		}
 
-		return nil, nil // the real targets are derived later, after the cheap checks
+		// A directory is not supported in the auto-meta mode: the
+		// identifiers are derived from the file names, and a tree would
+		// collide with itself. The expansion below only validates.
+		if _, err := expandUploadDirs(paths, f); err != nil {
+			return nil, nil, err
+		}
+
+		return nil, nil, nil // the real targets are derived later, after the cheap checks
 	}
 
 	if f.identifierScheme != "" {
-		return nil, errors.New("--identifier-scheme допустим только вместе с --auto-meta")
+		return nil, nil, errors.New("--identifier-scheme допустим только вместе с --auto-meta")
 	}
 
 	if f.creatorSource != "" {
-		return nil, errors.New("--creator-source допустим только вместе с --auto-meta: вне автометаданных авторы не выводятся")
+		return nil, nil, errors.New("--creator-source допустим только вместе с --auto-meta: вне автометаданных авторы не выводятся")
 	}
 
-	return uploadTargetsFrom(paths, f)
+	if f.keyFrom != "" {
+		return uploadTargetsKeyFrom(paths, f)
+	}
+
+	files, err := expandUploadDirs(paths, f)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	targets, err := uploadTargetsFrom(files, f)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return targets, nil, nil
 }
 
 // deriveAutoMetaTargets derives targets and metadata from the PDFs and
@@ -454,7 +494,7 @@ func headerOptsFrom(cfg *config.Config, f *uploadFlags) (ias3.HeaderOpts, error)
 func NewUploadCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *bool) *cobra.Command {
 	f := &uploadFlags{}
 	cmd := &cobra.Command{
-		Use:          "upload (FILE... | --list FILE) --item ID [--key NAME]",
+		Use:          "upload (FILE... | DIR... | --list FILE) --item ID [--key NAME | --key-from ШАБЛОН]",
 		Short:        "Загрузить файлы в элемент archive.org (IA-S3)",
 		Args:         cobra.ArbitraryArgs,
 		SilenceUsage: true,
@@ -489,6 +529,10 @@ func NewUploadCommand(configPath, journalPath *string, jsonOut, noColor, dryRun 
 		"схема идентификаторов при --auto-meta, единственное значение dir-nn-slug: <каталог>-<номер>-<имя-файла>")
 	fs.StringVar(&f.creatorSource, "creator-source", "",
 		"источник значений creator при --auto-meta: file — автор из имени файла (по умолчанию), pdf — Author из PDF, both — оба значения")
+	fs.StringVar(&f.keyFrom, "key-from", "",
+		"шаблон ключа (имени файла внутри элемента) для каждого файла: {Path} — путь относительно базового каталога, {Name} — имя с расширением, {Base} — имя без расширения, {Ext} — расширение без точки, {Dir} — относительный каталог, {Abs} — абсолютный путь; требует --item")
+	fs.StringVar(&f.baseDir, "base-dir", "",
+		"базовый каталог для относительных путей в --key-from (по умолчанию — общий родитель указанных целей)")
 
 	return cmd
 }
@@ -502,12 +546,14 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	con := console.New(out, errOut, writerIsTTY(out), noColor)
 
+	// The flag contract and the target resolution come first: a usage
+	// error must never be masked by a filesystem or a data error.
 	rawPaths, err := resolveTargets(args, expandHomePath(f.list))
 	if err != nil {
 		return exitUsage("%v", err)
 	}
 
-	targets, err := uploadTargetsOrAutoMeta(rawPaths, f)
+	targets, keyPlan, err := uploadTargets(rawPaths, f)
 	if err != nil {
 		return exitUsage("%v", err)
 	}
@@ -569,7 +615,7 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 	}
 
 	if dryRun {
-		return runUploadDry(con, journalFlag, targets, derived, opts)
+		return runUploadDry(con, journalFlag, targets, derived, opts, keyPlan)
 	}
 
 	jp, err := journalPathOr(journalFlag)
@@ -622,8 +668,12 @@ func runUpload(cmd *cobra.Command, args []string, f *uploadFlags,
 // network or creating the journal file. With --auto-meta the derived plan
 // shows identifier, title, collection and language per file; in manual
 // mode the batch metadata echoes after the Загрузить line — the review
-// surface the owner inspects before a live run.
-func runUploadDry(con *console.Console, journalFlag string, targets []runner.UploadTarget, derived []pdfmeta.Meta, opts ias3.HeaderOpts) error {
+// surface the owner inspects before a live run. With --key-from the
+// template and the base dir of the keys are named once, and every file
+// gets its own «путь → идентификатор/ключ» line.
+func runUploadDry(con *console.Console, journalFlag string, targets []runner.UploadTarget,
+	derived []pdfmeta.Meta, opts ias3.HeaderOpts, keyPlan *keyFromPlan,
+) error {
 	jp, err := journalPathOr(journalFlag)
 	if err != nil {
 		return err
@@ -634,6 +684,10 @@ func runUploadDry(con *console.Console, journalFlag string, targets []runner.Upl
 		return err
 	}
 	defer cleanup()
+
+	if keyPlan != nil {
+		con.Dimf("Ключи по шаблону --key-from «%s» · базовый каталог: %s", keyPlan.Template, keyPlan.BaseDir)
+	}
 
 	skipped := 0
 
