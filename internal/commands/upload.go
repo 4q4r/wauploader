@@ -46,6 +46,7 @@ type uploadFlags struct {
 	creatorSource           string
 	keyFrom                 string
 	baseDir                 string
+	includeHidden           bool
 }
 
 // schemeDirNNSlug is the only supported --identifier-scheme value: the
@@ -530,9 +531,11 @@ func NewUploadCommand(configPath, journalPath *string, jsonOut, noColor, dryRun 
 	fs.StringVar(&f.creatorSource, "creator-source", "",
 		"источник значений creator при --auto-meta: file — автор из имени файла (по умолчанию), pdf — Author из PDF, both — оба значения")
 	fs.StringVar(&f.keyFrom, "key-from", "",
-		"шаблон ключа (имени файла внутри элемента) для каждого файла: {Path} — путь относительно базового каталога, {Name} — имя с расширением, {Base} — имя без расширения, {Ext} — расширение без точки, {Dir} — относительный каталог, {Abs} — абсолютный путь; требует --item")
+		"шаблон ключа (имени файла внутри элемента) для каждого файла: {Path} — путь относительно базового каталога, {Name} — имя с расширением, {Base} — имя без расширения, {Ext} — расширение без точки, {Dir} — относительный каталог, {Abs} — абсолютный путь (только справочно: ключ должен быть относительным, {Abs} ключом быть не может); требует --item")
 	fs.StringVar(&f.baseDir, "base-dir", "",
 		"базовый каталог для относительных путей в --key-from (по умолчанию — общий родитель указанных целей)")
+	fs.BoolVar(&f.includeHidden, "include-hidden", false,
+		"включать скрытые файлы и каталоги (.) при раскрытии каталога (по умолчанию пропускаются; только вместе с --key-from)")
 
 	return cmd
 }

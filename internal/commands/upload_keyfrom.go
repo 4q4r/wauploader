@@ -57,6 +57,10 @@ func uploadKeyFromContract(f *uploadFlags) error {
 			return errors.New("--base-dir допустим только вместе с --key-from: без шаблона ключа нет относительных путей")
 		}
 
+		if f.includeHidden {
+			return errors.New("--include-hidden допустим только вместе с --key-from: скрытые файлы перечисляются только при раскрытии каталога")
+		}
+
 		return nil
 	}
 
@@ -110,13 +114,13 @@ func expandUploadDirs(paths []string, f *uploadFlags) ([]string, error) {
 			return nil, fmt.Errorf("каталог %s требует --key-from для сохранения структуры", p)
 		}
 
-		files, err := dirFiles(p)
+		files, err := dirFiles(p, f.includeHidden)
 		if err != nil {
 			return nil, err
 		}
 
 		if len(files) == 0 {
-			return nil, fmt.Errorf("каталог %s не содержит файлов", p)
+			return nil, fmt.Errorf("каталог %s не содержит файлов (скрытые файлы и каталоги по умолчанию пропускаются; --include-hidden включает их)", p)
 		}
 
 		out = append(out, files...)
@@ -129,7 +133,11 @@ func expandUploadDirs(paths []string, f *uploadFlags) ([]string, error) {
 // path (slash-separated). Symlinks are not followed: a symlinked
 // directory is reported as a target and fails loudly at the upload stage
 // instead of being silently expanded.
-func dirFiles(root string) ([]string, error) {
+//
+// Hidden entries — a path component starting with "." — are skipped unless
+// includeHidden is set: a tree with .git or .env must not be uploaded
+// wholesale by accident.
+func dirFiles(root string, includeHidden bool) ([]string, error) {
 	var rels []string
 
 	err := filepath.WalkDir(root, func(target string, entry fs.DirEntry, err error) error {
@@ -137,16 +145,28 @@ func dirFiles(root string) ([]string, error) {
 			return err
 		}
 
-		if entry.IsDir() {
-			return nil
-		}
-
 		rel, relErr := filepath.Rel(root, target)
 		if relErr != nil {
 			return relErr
 		}
 
-		rels = append(rels, filepath.ToSlash(rel))
+		slashRel := filepath.ToSlash(rel)
+
+		// The root itself is the operator's explicit choice — only the
+		// entries INSIDE the tree are subject to the hidden rule.
+		if !includeHidden && slashRel != "." && hasHiddenComponent(slashRel) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+
+			return nil
+		}
+
+		if entry.IsDir() {
+			return nil
+		}
+
+		rels = append(rels, slashRel)
 
 		return nil
 	})
@@ -162,6 +182,18 @@ func dirFiles(root string) ([]string, error) {
 	}
 
 	return files, nil
+}
+
+// hasHiddenComponent reports whether any component of a slash-separated
+// relative path starts with "." — a hidden file or directory.
+func hasHiddenComponent(rel string) bool {
+	for _, segment := range strings.Split(rel, "/") {
+		if strings.HasPrefix(segment, ".") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // uploadTargetsKeyFrom builds the targets of a --key-from run: one shared
@@ -305,8 +337,10 @@ func isKeyFromField(name string) bool {
 }
 
 // renderKey renders one file's key from the template and validates it:
-// an empty key and a key with a ".." segment (a traversal out of the
-// item) are usage errors.
+// an empty key and a key with a "..", "." or empty segment (a traversal
+// out of the item, an absolute path, a doubled or trailing separator) are
+// usage errors. The key is never normalized — a key that is not a clean
+// relative path is refused, not repaired.
 func renderKey(tmpl *template.Template, p, abs, rel string) (string, error) {
 	name := filepath.Base(abs)
 	ext := filepath.Ext(name)
@@ -336,8 +370,11 @@ func renderKey(tmpl *template.Template, p, abs, rel string) (string, error) {
 	}
 
 	for _, segment := range strings.Split(key, "/") {
-		if segment == ".." {
+		switch segment {
+		case "..":
 			return "", fmt.Errorf("недопустимый ключ «%s» для файла %s: путь не должен содержать «..»", key, p)
+		case "", ".":
+			return "", fmt.Errorf("недопустимый ключ «%s» для файла %s: пустой сегмент, «.» или ведущий/двойной «/»", key, p)
 		}
 	}
 
@@ -373,7 +410,8 @@ func keyBaseDir(paths []string, baseDirFlag string) (string, error) {
 
 // commonParentDir returns the longest common parent directory of the given
 // paths, or the current working directory when they have none (different
-// roots).
+// roots). Targets under different top-level directories share only the
+// leading empty segment: their common parent is the filesystem root.
 func commonParentDir(paths []string) (string, error) {
 	var common []string
 
@@ -404,7 +442,15 @@ func commonParentDir(paths []string) (string, error) {
 		return cwd, nil
 	}
 
-	return filepath.FromSlash(strings.Join(common, "/")), nil
+	joined := strings.Join(common, "/")
+	if joined == "" {
+		// Only the leading empty segment is shared: the common parent is
+		// the filesystem root. An empty base dir would break the relative
+		// path computation with a confusing error.
+		joined = "/"
+	}
+
+	return filepath.FromSlash(joined), nil
 }
 
 // commonSegments returns the longest common prefix of two path-segment
