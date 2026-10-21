@@ -220,13 +220,13 @@ they carry secrets, so they never come from a file.
 directory tree is uploaded into **one** archive.org item with the structure preserved:
 
 ```bash
-wauploader upload ~/datasets/top-taganrog \
-    --item taganrog-dataset-2026 \
+wauploader upload ~/datasets/reports \
+    --item reports-dataset-2026 \
     --key-from "{Path}" \
     --collection opensource --mediatype data --dry-run
 ```
 
-The keys come out as `top-taganrog/001.json`, `top-taganrog/sub/002.json` — the
+The keys come out as `reports/001.json`, `reports/sub/002.json` — the
 directory name survives, because the default base directory is the **common parent of
 the given targets** (for a directory, its own parent; with no common parent — the
 targets live in different roots — the filesystem root `/` is used). Set the base
@@ -270,7 +270,7 @@ without them the command fails with an explanation.
 
 ```bash
 wauploader upload --auto-meta --identifier-scheme dir-nn-slug \
-    --collection opensource --mediatype texts --dry-run ~/articles/athens/*.pdf
+    --collection opensource --mediatype texts --dry-run ./papers/*.pdf
 ```
 
 What is derived from the file:
@@ -481,9 +481,10 @@ while the repository carries no release tag.
 
 ## 📦 Published with this tool
 
-21 items were published with this tool on 2026-10-20 (15 Athens/Sparta papers, one
-Wordstat keyword dataset, five third-party papers). The list is verifiable against
-archive.org itself:
+20 items were published with this tool on 2026-10-20: 8 Athens papers, 6 Sparta
+papers, one Wordstat keyword dataset, and five third-party papers. The list is
+verifiable against archive.org itself (the query returns 21 identifiers — one of them
+is the empty shell mentioned at the end of this section):
 
 ```sh
 curl -s 'https://archive.org/advancedsearch.php?q=scanner%3A%22wauploader+0.1.0%22&fl%5B%5D=identifier&rows=50&output=json'
@@ -505,7 +506,6 @@ curl -s 'https://archive.org/advancedsearch.php?q=scanner%3A%22wauploader+0.1.0%
 | [sparta-4-clark-spartan-women](https://archive.org/details/sparta-4-clark-spartan-women) | `opensource` | `texts` |
 | [sparta-5-nafissi-whip-agones-orthia](https://archive.org/details/sparta-5-nafissi-whip-agones-orthia) | `opensource` | `texts` |
 | [sparta-6-darwin-spartan-kings-ephors](https://archive.org/details/sparta-6-darwin-spartan-kings-ephors) | `opensource` | `texts` |
-| [sparta-7-pechatnova-gerontokratia-plato](https://archive.org/details/sparta-7-pechatnova-gerontokratia-plato) | `opensource` | `texts` |
 | [intrieri-philia-interstatale-isocrate-2021](https://archive.org/details/intrieri-philia-interstatale-isocrate-2021) | `opensource` | `texts` |
 | [gomez-mendoza-deporte-universitario-uaemex-2023](https://archive.org/details/gomez-mendoza-deporte-universitario-uaemex-2023) | `opensource` | `texts` |
 | [leshkevich-filosofia-nauki-2001](https://archive.org/details/leshkevich-filosofia-nauki-2001) | `opensource` | `texts` |
@@ -516,6 +516,9 @@ curl -s 'https://archive.org/advancedsearch.php?q=scanner%3A%22wauploader+0.1.0%
 The dataset item holds the Wordstat keyword-export tree with the directory structure
 preserved as nested item keys. The 62 `*.error-403.json` dumps of the original tree
 were left out — the published item contains only the collected data.
+
+One further PDF was rejected by archive.org's content check (`400 BadContent`) and
+left an empty item shell behind, so it is not counted as a published paper above.
 
 ---
 
