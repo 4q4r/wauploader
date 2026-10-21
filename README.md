@@ -43,12 +43,12 @@ Batch-archiving CLI written in Go: Save Page Now 2 (SPN2) for page captures, IA-
 
 ## ⚡ Features
 
-- **Save (SPN2)** — all 14 documented Save Page Now 2 options as flags, 11 of them also as config keys: `capture_all`, `capture_outlinks`, `capture_screenshot`, `delay_wb_availability`, `force_get`, `skip_first_archive`, `outlinks_availability`, `email_result`, the dedup window `if_not_archived_within`, `js_behavior_timeout`, `capture_cookie`, `use_user_agent`, `target_username`/`target_password`.
+- **Save (SPN2)** — all 14 documented Save Page Now 2 options as flags, 10 of them also as config keys: `capture_all`, `capture_outlinks`, `capture_screenshot`, `delay_wb_availability`, `force_get`, `skip_first_archive`, `outlinks_availability`, `email_result`, the dedup window `if_not_archived_within`, `js_behavior_timeout`, `capture_cookie`, `use_user_agent`, `target_username`/`target_password`.
 - **Upload (IA-S3)** — files into archive.org items: one shared item (`--item`), a per-file identifier template (`--identifier-from "custom-{{.Base}}"`), a whole directory tree as one item with the tree preserved (`--key-from "{Path}"` plus a directory argument), or fully automatic PDF metadata (`--auto-meta`, needs poppler-utils); repeatable `--meta NAME=VALUE`, `--title`/`--description`, MD5 verification, and a derive watch.
 - **Resume** — a bbolt journal per target: an interrupted run continues in the next one instead of starting over. An interrupted multi-gigabyte PUT safely restarts from byte 0, while the other files of the item keep their state.
 - **Fault tolerance** — full parsing of SPN2 refusals (a refusal can arrive as HTTP 200 with `{"status":"error"}` and no `job_id`), a `retryable` / `quota` / `terminal` error taxonomy, parking of quota-exhausted targets until the next day, a retry ladder with full jitter that honors `Retry-After`, and per-host politeness toward the target sites.
 - **Three output modes** — a Russian colored TTY, plain text outside a terminal (byte-for-byte), and machine-readable `--json` (one JSON object per event).
-- **Configuration** — a single TOML file; environment variables are never read; an unknown config key produces a warning that names the key.
+- **Configuration** — a single TOML file; no environment variable is consulted for configuration or credentials; an unknown config key produces a warning that names the key.
 - **Russian console by design** — the human-facing output is in Russian. That is the tool's deliberate choice, not a rough edge. `--json` gives machines one object per event; the tool's own error strings stay Russian there too (the server's own messages and the JSON field names are not translated).
 
 ---
@@ -69,7 +69,7 @@ make build          # → ./wauploader (static binary, CGO_ENABLED=0)
 ./wauploader init
 ```
 
-Interactively asks for your archive.org email and password, exchanges them for S3 keys and login cookies through the `xauthn` endpoint, and writes them to `~/.config/wauploader/wauploader.toml` with mode 0600. The password is never stored. You can paste the S3 keys in by hand instead — they are generated at <https://archive.org/account/s3.php>.
+Interactively asks for your archive.org email and password, exchanges them for S3 keys and login cookies through the `xauthn` endpoint, and writes them to `~/.config/wauploader/wauploader.toml` with mode 0600. The password is never persisted — it is not written to the config and never printed. You can paste the S3 keys in by hand instead — they are generated at <https://archive.org/account/s3.php>.
 
 ### 3. Save your first pages
 
@@ -114,7 +114,7 @@ A dry run prints the whole plan — target, identifier, key, derived metadata �
 
 ## ⚙️ Configuration
 
-One file: `~/.config/wauploader/wauploader.toml` (override the path with `--config`). Environment variables are **never** read. An unknown key produces a warning that names the key. A fully annotated example: [`docs/config-example.toml`](docs/config-example.toml).
+One file: `~/.config/wauploader/wauploader.toml` (override the path with `--config`). No environment variable is consulted for configuration or credentials. An unknown key produces a warning that names the key. A fully annotated example: [`docs/config-example.toml`](docs/config-example.toml).
 
 | Section | Key | Default | Description |
 | :-- | :-- | :-- | :-- |
@@ -339,11 +339,9 @@ overridden by `XDG_DATA_HOME` and by `--journal`). Every target has a state:
 
 `queued → submitted → pending → done | failed | skipped | quota_parked`
 
-- **Resume** — a second `save`/`upload` run skips the targets in `done` (`--force`
-  puts the save targets back to work) and picks the rest up where the previous run
-  stopped.
-- **Quota** — targets parked on the SPN2 daily quota (`quota_parked`) do not wake up
-  on their own: list them explicitly in the next run.
+- **Resume (save)** — a new `save` run continues the targets left in `queued`, `submitted` or `pending`; targets in `done` are skipped unless `--force` is given, and targets in `failed`, `quota_parked` or `skipped` run again once they are listed explicitly.
+- **Resume (upload)** — a new `upload` run continues only the files left in `queued`; files in `done` are skipped, and files in `failed` or `skipped` run again once they are listed explicitly. Uploads have no `--force` flag.
+- **Quota** — `quota_parked` is a save-side state: targets parked on the SPN2 daily quota never wake up on their own, so list them explicitly in the next `save` run.
 - **Transparency** — `wauploader jobs` shows the journal; `--clear` cleans it.
 - **Interrupted upload** — a partial PUT has no resume: the file starts over, the
   other files of the item are unaffected.
@@ -363,10 +361,10 @@ overridden by `XDG_DATA_HOME` and by `--journal`). Every target has a state:
 
 ## 🛡️ Security
 
-- **The password is never stored.** `wauploader init` uses it once to exchange for keys and cookies and then drops it: it is in neither the config nor the process memory.
+- **The password is never persisted.** `wauploader init` uses it once to exchange for keys and cookies: it is never written to the config and never printed. It is held in memory for the duration of the authentication exchange, and the local reference to it is cleared afterwards.
 - **The config file is 0600.** Writes go through a temp file plus a rename; the 0600 mode is re-applied on every write, whatever the file held before.
-- **Secrets never reach the output.** Keys and cookies are printed only masked (first 4 characters plus the length); they never appear in `--json` events or in error messages.
-- **Environment variables are never read.** Secrets cannot leak in through the environment — only through the 0600 TOML file and the command-line flags.
+- **Secrets never reach the output.** Keys and cookies are printed only masked: a value of 8 characters or fewer is shown as its length alone, a longer one as its first 4 characters plus its length. They never appear in `--json` events or in error messages.
+- **Credentials never come from the environment.** No environment variable is consulted for configuration or credentials: they live only in the 0600 TOML file and in the command-line flags. The environment is read for three other things only — `XDG_DATA_HOME` (journal location), `NO_COLOR` and `TERM` (color gate), and the standard HTTP proxy variables.
 - **Authorization only travels to archive.org.** Across a redirect chain (the frequent 307s of IA-S3) the header is kept only for `*.archive.org` and stripped on every third-party host.
 - **Target-site passwords** (`--target-password`, `--capture-cookie`) exist only as flags and are never written to the event journal.
 - **The archive.org-managed item files are never overwritten.** A PUT of `<id>_meta.xml` or `<id>_files.xml` is refused: it would corrupt the item's own metadata.
@@ -400,7 +398,7 @@ Save request flow:
 
 1. The targets are merged from the arguments and `--list` (mutually exclusive); the flags override the config; the config is validated fail-fast with a named error.
 2. The journal filters out the finished targets — without `--force` they are skipped.
-3. The credentials are resolved per `auth_mode`: the keys are preferred, the cookies are the fallback.
+3. The credentials are resolved per `auth_mode`: in `auto` the keys are preferred and the cookies are the fallback; `keys` and `cookies` each select one form explicitly (with `cookies` the keys are dropped).
 4. `POST /save` with the options; a refusal can arrive as HTTP 200 with `{"status":"error"}` — the body is always parsed: `too-many-daily-captures` parks the target until the next day, the retryable classes are retried inside the ladder, the terminal ones are recorded at once.
 5. The status is polled until the job ends; a server-stated delay ("Your capture will begin in NNs") is honored, and `job_wait` bounds the wait.
 6. The summary is printed ("saved · skipped · parked · failed"), and the process exits with 0/1/2/3.
@@ -411,7 +409,7 @@ Upload request flow:
 2. `collection` and `mediatype` must be set — there are no defaults.
 3. The upload runs on the S3 keys only: IA-S3 does not accept cookies; the check happens before the hashing, not after 50 GB.
 4. Skip-guard: a file already lying in the item with the same MD5 and no active item tasks is skipped (`--checksum-skip` turns the skip off).
-5. `PUT` with the full `x-archive-*` set; `Transfer-Encoding: chunked` is forbidden (an IA-S3 requirement); a plain 503 SlowDown re-sends the whole file, a 503 "appears to be spam" is terminal.
+5. `PUT` with the `x-archive-*` control headers (collection, mediatype, derive queueing, version keeping, item metadata); `Transfer-Encoding: chunked` is forbidden (an IA-S3 requirement); a plain 503 SlowDown re-sends the whole file, a 503 "appears to be spam" is terminal.
 6. `--verify` compares the MD5 through the Item Metadata API; `--wait-derive` watches the derive against the baseline `task_id` from the Tasks API within `job_wait`.
 7. The journal and the exit codes work as they do for saves.
 
