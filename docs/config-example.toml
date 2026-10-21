@@ -1,51 +1,56 @@
-# Пример файла конфигурации wauploader с комментариями ко всем ключам.
+# Example wauploader configuration file, annotated with a comment for every key.
 #
-# Путь по умолчанию: ~/.config/wauploader/wauploader.toml
-#   (переопределяется глобальным флагом --config)
-# Права доступа: 0600 — их устанавливает `wauploader init`.
+# Default path: ~/.config/wauploader/wauploader.toml
+#   (overridden by the global --config flag)
+# Permissions: 0600 — `wauploader init` sets them.
 #
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ НЕ ЧИТАЮТСЯ НИКОГДА: вся конфигурация живёт только
-# в этом файле и во флагах командной строки. Флаги имеют приоритет над
-# файлом. Неизвестные ключи не игнорируются молча — wauploader выводит
-# предупреждение с именем каждого такого ключа.
+# CONFIGURATION VALUES ARE NEVER READ FROM ENVIRONMENT VARIABLES: the whole
+# configuration lives only in this file and in the command-line flags. Flags
+# take precedence over the file. Unknown keys are not ignored silently —
+# wauploader prints a warning naming each such key.
 #
-# Отсутствующий файл — нормальная ситуация (zero-configuration): применяются
-# значения по умолчанию из этого примера.
+# The environment variables the tool does read — NO_COLOR and TERM (the color
+# output) and XDG_DATA_HOME (the default journal location) — never supply a
+# configuration value.
+#
+# A missing file is a normal situation (zero-configuration): the default
+# values from this example apply.
 
-# ─── Учётные данные archive.org ───────────────────────────────────────────
+# ─── archive.org credentials ──────────────────────────────────────────────
 [auth]
-# Ключи IA-S3. Обязательны для `wauploader upload` (cookies IA-S3 не
-# принимает); для `save` достаточно кук. Генерируются на
-# https://archive.org/account/s3.php. Должны быть заданы ВМЕСТЕ:
-# оба или ни одного (иначе — ошибка конфигурации).
-# По умолчанию пусто; `wauploader init` заполняет их автоматически.
+# IA-S3 keys. Required for `wauploader upload` (IA-S3 does not accept
+# cookies). For `save` under auth_mode = "auto" they are used first, the
+# cookies being the fallback. Generated at
+# https://archive.org/account/s3.php. They must be set TOGETHER: both of
+# them or neither (otherwise it is a configuration error). Empty by default;
+# `wauploader init` fills them in automatically.
 s3_access = ""
 s3_secret = ""
 
-# Куки входа archive.org (cookie "logged-in-user" и "logged-in-sig").
-# Необязательны: используются SPN2, когда ключи не заданы или
-# auth_mode = "cookies". По умолчанию пусто.
+# archive.org login cookies (the "logged-in-user" and "logged-in-sig" cookies).
+# Optional: under auth_mode = "auto" SPN2 falls back to them when no keys are
+# set; auth_mode = "cookies" uses them exclusively. Empty by default.
 cookie_user = ""
 cookie_sig = ""
 
-# ─── Параметры сохранений (Save Page Now 2) ───────────────────────────────
+# ─── Save Page Now 2 parameters ───────────────────────────────────────────
 [spn2]
-# Дедупликация: не сохранять, если снимок уже есть за последние N.
-# Форма IA timedelta: "120" (голое число = секунды) или "3d 5h 20m"
-# (единицы d, h, m, s). По умолчанию выключено (пустая строка).
-# Флаг --if-not-archived-within переопределяет это значение.
+# Dedup: do not save if a snapshot already exists within the last N.
+# IA timedelta form: "120" (a bare number = seconds) or "3d 5h 20m"
+# (units d, h, m, s). Off by default (empty string).
+# The --if-not-archived-within flag overrides this value.
 if_not_archived_within = ""
 
-# Все логические ключи ниже соответствуют опциям SPN2 1:1 и по умолчанию
-# выключены (false). Флаги командной строки включают их по одному:
-#   --capture-all             capture_all: сохранять всё содержимое страницы
-#   --capture-outlinks        capture_outlinks: сохранять найденные ссылки
-#   --capture-screenshot      capture_screenshot: снять скриншот страницы
-#   --delay-wb-availability   delay_wb_availability: отложить появление снимка в Wayback
-#   --force-get               force_get: сохранять даже при наличии свежего снимка
-#   --skip-first-archive      skip_first_archive: пропустить первый архивный запрос
-#   --outlinks-availability   outlinks_availability: проверить доступность ссылок
-#   --email-result            email_result: прислать результат письмом
+# All boolean keys below map 1:1 onto the SPN2 options and are off
+# (false) by default. The command-line flags turn them on one by one:
+#   --capture-all             capture_all: save the full page content
+#   --capture-outlinks        capture_outlinks: save the links found on the page
+#   --capture-screenshot      capture_screenshot: take a screenshot of the page
+#   --delay-wb-availability   delay_wb_availability: delay the snapshot's appearance in Wayback
+#   --force-get               force_get: request the save even when a recent snapshot exists
+#   --skip-first-archive      skip_first_archive: skip the first archive request
+#   --outlinks-availability   outlinks_availability: check the availability of the links
+#   --email-result            email_result: send the result by email
 capture_all = false
 capture_outlinks = false
 capture_screenshot = false
@@ -55,57 +60,57 @@ skip_first_archive = false
 outlinks_availability = false
 email_result = false
 
-# Тайм-аут JS-поведения в секундах (0–30; 0 отключает JS).
-# По умолчанию 5. Флаг --js-behavior-timeout переопределяет.
+# JS behavior timeout in seconds (0–30; 0 disables JS).
+# Defaults to 5. The --js-behavior-timeout flag overrides it.
 js_behavior_timeout = 5
 
-# Чем сохранять: "auto" — ключи, если заданы, иначе куки (по умолчанию);
-# "keys" — только ключи S3; "cookies" — только куки.
+# How to save: "auto" — the keys if they are set, otherwise the cookies
+# (the default); "keys" — the S3 keys only; "cookies" — the cookies only.
 auth_mode = "auto"
 
-# ─── Параметры загрузок (IA-S3) ───────────────────────────────────────────
+# ─── Upload parameters (IA-S3) ────────────────────────────────────────────
 [upload]
-# ОБЯЗАТЕЛЬНЫ без значения по умолчанию: загрузка без коллекции не
-# выполняется (fail-fast). Флаг --collection переопределяет.
+# REQUIRED, no default: an upload without a collection does not
+# run (fail-fast). The --collection flag overrides it.
 #collection = "test_collection"
 
-# ОБЯЗАТЕЛЕН без значения по умолчанию. Допустимые значения:
+# REQUIRED, no default. Allowed values:
 # texts, etree, audio, movies, software, image, data, web.
-# Флаг --mediatype переопределяет.
+# The --mediatype flag overrides it.
 #mediatype = "data"
 
-# Ставить деривацию в очередь после загрузки. По умолчанию true.
-# --no-derive выключает; --wait-derive принудительно включает.
+# Queue the derive after the upload. Defaults to true.
+# --no-derive turns it off; --wait-derive forces it on.
 queue_derive = true
 
-# Сохранять прежние версии перезаписываемых файлов. По умолчанию true.
-# --no-keep-old-version выключает.
+# Keep the previous versions of overwritten files. Defaults to true.
+# --no-keep-old-version turns it off.
 keep_old_version = true
 
-# Приоритетная очередь деривации. По умолчанию false.
-# Флаг --interactive-priority включает.
+# Priority queue for the derive. Defaults to false.
+# The --interactive-priority flag turns it on.
 interactive_priority = false
 
-# ─── Ограничения темпа и параллелизма ─────────────────────────────────────
+# ─── Rate and concurrency limits ──────────────────────────────────────────
 [limits]
-# Сохранений в минуту (лимит archive.org для авторизованных: 7/мин;
-# по умолчанию 5 — ~80% лимита). Должен быть не меньше 1.
+# Saves per minute (the archive.org limit for authenticated users: 7/min;
+# the default of 5 is ~80% of the limit). Must be at least 1.
 save_per_minute = 5
 
-# Параллельных сохранений. По умолчанию 4.
+# Parallel saves. Defaults to 4.
 save_concurrency = 4
 
-# Параллельных загрузок IA-S3. По умолчанию 2.
+# Parallel IA-S3 uploads. Defaults to 2.
 upload_concurrency = 2
 
-# Максимум одновременных задач на один хост-цель. По умолчанию 3
-# (вежливость к сайтам-целям).
+# The maximum number of concurrent jobs against one target host. Defaults
+# to 3 (politeness towards the target sites).
 per_host_concurrency = 3
 
-# Сколько ждать завершения одной задачи (SPN2-сохранение или деривация).
-# Форма IA timedelta ("20m", "1h", "3d 5h 20m"). По умолчанию "20m".
+# How long to wait for one job to finish (an SPN2 save or a derive).
+# IA timedelta form ("20m", "1h", "3d 5h 20m"). Defaults to "20m".
 job_wait = "20m"
 
-# ─── Консоль (зарезервировано) ────────────────────────────────────────────
-# Секция [console] пока пуста: цвет управляется флагом --no-color,
-# переменной NO_COLOR и значением TERM, но не конфигурационным файлом.
+# ─── Console (reserved) ───────────────────────────────────────────────────
+# The [console] section is empty for now: the color is controlled by the
+# --no-color flag and the NO_COLOR and TERM variables, but not by this file.
