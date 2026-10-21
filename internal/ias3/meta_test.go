@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,14 +56,18 @@ func readMetaFixture(t *testing.T, name string) []byte {
 }
 
 // metaHandler serves a fixture for the metadata path and records the last
-// request (path + Authorization) for wire assertions.
-func metaHandler(t *testing.T, fixture string, captured *map[string]string) http.Handler {
+// request (path + Authorization) for wire assertions. The record lives in a
+// mutex-guarded wireRecorder: the handler writes it from its own goroutine
+// while the test reads it from the test goroutine.
+func metaHandler(t *testing.T, fixture string, rec *wireRecorder) http.Handler {
 	t.Helper()
 	raw := readMetaFixture(t, fixture)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if captured != nil {
-			(*captured)["path"] = r.URL.Path
-			(*captured)["authorization"] = r.Header.Get("Authorization")
+		if rec != nil {
+			rec.update(func(cr *wireRecord) {
+				cr.path = r.URL.Path
+				cr.authorization = r.Header.Get("Authorization")
+			})
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(raw)
@@ -70,20 +75,24 @@ func metaHandler(t *testing.T, fixture string, captured *map[string]string) http
 }
 
 // tasksHandler serves a fixture for the tasks.php path and records the last
-// request (query, Authorization, cookies) for wire assertions.
-func tasksHandler(t *testing.T, fixture string, captured *map[string]int, cookieCount *int) http.Handler {
+// request (query criteria, Authorization, cookies) for wire assertions. The
+// record lives in a mutex-guarded wireRecorder: the handler writes it from
+// its own goroutine while the test reads it from the test goroutine.
+func tasksHandler(t *testing.T, fixture string, rec *wireRecorder) http.Handler {
 	t.Helper()
 	raw := readMetaFixture(t, fixture)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if captured != nil {
-			q := r.URL.Query()
-			(*captured)["identifier"] = len(q["identifier"])
-			(*captured)["catalog"] = len(q["catalog"])
-			(*captured)["history"] = len(q["history"])
-			(*captured)["limit"] = len(q["limit"])
-		}
-		if cookieCount != nil {
-			*cookieCount = len(r.Cookies())
+		if rec != nil {
+			rec.update(func(cr *wireRecord) {
+				q := r.URL.Query()
+				cr.identifier = len(q["identifier"])
+				cr.catalog = len(q["catalog"])
+				cr.history = len(q["history"])
+				cr.limit = len(q["limit"])
+				cr.authorization = r.Header.Get("Authorization")
+				cr.cookieHeader = r.Header.Get("Cookie")
+				cr.cookieCount = len(r.Cookies())
+			})
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(raw)
@@ -93,15 +102,16 @@ func tasksHandler(t *testing.T, fixture string, captured *map[string]int, cookie
 // --- ItemFiles -------------------------------------------------------------
 
 func TestItemFilesParses(t *testing.T) {
-	captured := map[string]string{}
-	cl := newWebTestClient(t, metaHandler(t, "meta_files.json", &captured))
+	rec := &wireRecorder{}
+	cl := newWebTestClient(t, metaHandler(t, "meta_files.json", rec))
 
 	files, err := cl.ItemFiles(context.Background(), "testid1")
 	require.NoError(t, err)
 	require.Len(t, files, 3, "every files[] entry must be mapped")
 
-	assert.Equal(t, "/metadata/testid1", captured["path"], "must GET the Metadata Read endpoint for the identifier")
-	assert.True(t, strings.HasPrefix(captured["authorization"], "LOW "),
+	got := rec.get()
+	assert.Equal(t, "/metadata/testid1", got.path, "must GET the Metadata Read endpoint for the identifier")
+	assert.True(t, strings.HasPrefix(got.authorization, "LOW "),
 		"S3 keys must ride as Authorization: LOW (restricted items need them; cookies are never used)")
 
 	// String-typed numbers (size/mtime arrive as strings in real answers,
@@ -197,8 +207,8 @@ func TestDeriveStates(t *testing.T) {
 		{"tasks_done.json", DeriveDone, "завершена"},
 	}
 	for _, tc := range cases {
-		captured := map[string]int{}
-		cl := newWebTestClient(t, tasksHandler(t, tc.fixture, &captured, nil))
+		rec := &wireRecorder{}
+		cl := newWebTestClient(t, tasksHandler(t, tc.fixture, rec))
 
 		st, err := cl.DeriveStatus(context.Background(), "testid1")
 		require.NoErrorf(t, err, "%s", tc.fixture)
@@ -206,10 +216,11 @@ func TestDeriveStates(t *testing.T) {
 		assert.Containsf(t, st.String(), tc.wantFrag,
 			"%s: Russian console String() must describe the state", tc.fixture)
 
-		assert.Equalf(t, 1, captured["identifier"], "%s: identifier criteria required", tc.fixture)
-		assert.Equalf(t, 1, captured["catalog"], "%s: catalog=1 required", tc.fixture)
-		assert.Equalf(t, 1, captured["history"], "%s: history=1 required", tc.fixture)
-		assert.Equalf(t, 1, captured["limit"], "%s: explicit page limit required (presence scan)", tc.fixture)
+		got := rec.get()
+		assert.Equalf(t, 1, got.identifier, "%s: identifier criteria required", tc.fixture)
+		assert.Equalf(t, 1, got.catalog, "%s: catalog=1 required", tc.fixture)
+		assert.Equalf(t, 1, got.history, "%s: history=1 required", tc.fixture)
+		assert.Equalf(t, 1, got.limit, "%s: explicit page limit required (presence scan)", tc.fixture)
 	}
 }
 
@@ -217,30 +228,24 @@ func TestDeriveStates(t *testing.T) {
 // Authorization: LOW present, cookies never sent — even when the credential
 // set carries them.
 func TestDeriveStatusTasksAuthHeader(t *testing.T) {
-	var authHeader, cookieHeader string
-	var cookieCount int
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader = r.Header.Get("Authorization")
-		cookieHeader = r.Header.Get("Cookie")
-		cookieCount = len(r.Cookies())
-		raw := readMetaFixture(t, "tasks_running.json")
-		_, _ = w.Write(raw)
-	})
-	cl := newWebTestClientWithCookies(t, h)
+	rec := &wireRecorder{}
+	cl := newWebTestClientWithCookies(t, tasksHandler(t, "tasks_running.json", rec))
 
 	st, err := cl.DeriveStatus(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.Equal(t, DeriveRunning, st)
-	assert.True(t, strings.HasPrefix(authHeader, "LOW AKIAIOSFODNN7EXAMPLE:"),
-		"Tasks API requires the S3-key LOW header, got %q", authHeader)
-	assert.Empty(t, cookieHeader, "the raw Cookie header must never be attached to tasks.php")
-	assert.Equal(t, 0, cookieCount, "the Tasks API rejects cookies — zero cookies may reach it")
+
+	got := rec.get()
+	assert.True(t, strings.HasPrefix(got.authorization, "LOW AKIAIOSFODNN7EXAMPLE:"),
+		"Tasks API requires the S3-key LOW header, got %q", got.authorization)
+	assert.Empty(t, got.cookieHeader, "the raw Cookie header must never be attached to tasks.php")
+	assert.Equal(t, 0, got.cookieCount, "the Tasks API rejects cookies — zero cookies may reach it")
 }
 
 // TestDeriveErrorEnvelope: success:false envelopes must surface the server's
 // error text inside a Russian-framed failure, never a silent zero state.
 func TestDeriveErrorEnvelope(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil))
 
 	st, err := cl.DeriveStatus(context.Background(), "testid1")
 	require.Error(t, err, "success:false must be an error, not a state")
@@ -254,9 +259,9 @@ func TestDeriveErrorEnvelope(t *testing.T) {
 // --- WaitDerive ---------------------------------------------------------------
 
 func TestWaitDeriveTimeout(t *testing.T) {
-	calls := 0
+	var calls atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		_, _ = w.Write(readMetaFixture(t, "tasks_running.json"))
 	})
 	cl, ts := newTestClient(t, h)
@@ -266,15 +271,14 @@ func TestWaitDeriveTimeout(t *testing.T) {
 	require.Error(t, err, "a derive that never finishes must end in a timeout error")
 	assert.Contains(t, err.Error(), "время", "the timeout error must be Russian and name the wait")
 	assert.Contains(t, err.Error(), "testid1", "the timeout error must name the item")
-	assert.Greater(t, calls, 1, "the loop must have polled repeatedly, not given up at once")
+	assert.Greater(t, calls.Load(), int64(1), "the loop must have polled repeatedly, not given up at once")
 }
 
 func TestWaitDeriveSuccessAfterPolling(t *testing.T) {
-	calls := 0
+	var calls atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
 		fixture := "tasks_queued.json"
-		if calls >= 3 {
+		if calls.Add(1) >= 3 {
 			fixture = "tasks_done.json"
 		}
 		_, _ = w.Write(readMetaFixture(t, fixture))
@@ -284,15 +288,15 @@ func TestWaitDeriveSuccessAfterPolling(t *testing.T) {
 
 	err := WaitDerive(context.Background(), cl, "testid1", 0, time.Millisecond, 5*time.Second)
 	require.NoError(t, err, "queued→queued→done must end in success")
-	assert.GreaterOrEqual(t, calls, 3, "every non-terminal poll must precede the done answer")
+	assert.GreaterOrEqual(t, calls.Load(), int64(3), "every non-terminal poll must precede the done answer")
 }
 
 // TestWaitDeriveErrorTerminal: wait_admin=2 is terminal with the task_id in
 // the message; the loop must stop immediately, not keep polling.
 func TestWaitDeriveErrorTerminal(t *testing.T) {
-	calls := 0
+	var calls atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		_, _ = w.Write(readMetaFixture(t, "tasks_error.json"))
 	})
 	cl, ts := newTestClient(t, h)
@@ -300,7 +304,7 @@ func TestWaitDeriveErrorTerminal(t *testing.T) {
 
 	err := WaitDerive(context.Background(), cl, "testid1", 0, time.Millisecond, 5*time.Second)
 	require.Error(t, err)
-	assert.Equal(t, 1, calls, "a derive error is terminal — no further polling")
+	assert.Equal(t, int64(1), calls.Load(), "a derive error is terminal — no further polling")
 	assert.Contains(t, err.Error(), "103", "the error must include the derive task_id when present")
 	assert.Contains(t, err.Error(), "ошибкой", "the error must be Russian")
 }
@@ -318,7 +322,7 @@ func TestWaitDeriveErrorTerminal(t *testing.T) {
 // task_id 99; with baseline 99 (captured pre-PUT) the history entry is NOT
 // newer → pending, never a faked done.
 func TestDeriveStatusBaselineBlocksStaleHistory(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil))
 
 	st, err := cl.DeriveStatusSince(context.Background(), "testid1", 99)
 	require.NoError(t, err)
@@ -328,7 +332,7 @@ func TestDeriveStatusBaselineBlocksStaleHistory(t *testing.T) {
 // TestDeriveStatusFreshBaselineHistoryDone: zero baseline (fresh item / no
 // prior derives) → any history derive is this batch's result → done.
 func TestDeriveStatusFreshBaselineHistoryDone(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil))
 
 	st, err := cl.DeriveStatusSince(context.Background(), "testid1", 0)
 	require.NoError(t, err)
@@ -339,9 +343,9 @@ func TestDeriveStatusFreshBaselineHistoryDone(t *testing.T) {
 // end-to-end: baseline equal to the history derive's id keeps WaitDerive
 // polling into the timeout — no success on poll #1.
 func TestWaitDeriveBaselineBlocksStaleHistory(t *testing.T) {
-	calls := 0
+	var calls atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		_, _ = w.Write(readMetaFixture(t, "tasks_done.json"))
 	})
 	cl, ts := newTestClient(t, h)
@@ -350,14 +354,14 @@ func TestWaitDeriveBaselineBlocksStaleHistory(t *testing.T) {
 	err := WaitDerive(context.Background(), cl, "testid1", 99, time.Millisecond, 25*time.Millisecond)
 	require.Error(t, err, "a non-newer history derive must keep the caller waiting, never fake success")
 	assert.Contains(t, err.Error(), "время", "the wait must end in the Russian timeout error")
-	assert.Greater(t, calls, 1, "the stale-done answer must not terminate the loop")
+	assert.Greater(t, calls.Load(), int64(1), "the stale-done answer must not terminate the loop")
 }
 
 // TestDeriveStatusAnyCatalogTaskBlocksHistory: a running archive.php (the
 // PUT's own ingest task) fills the catalog — the observation must stay
 // pending and NEVER fall through to the done derive sitting in history.
 func TestDeriveStatusAnyCatalogTaskBlocksHistory(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil))
 
 	st, err := cl.DeriveStatusSince(context.Background(), "testid1", 0)
 	require.NoError(t, err)
@@ -368,7 +372,7 @@ func TestDeriveStatusAnyCatalogTaskBlocksHistory(t *testing.T) {
 // newest catalog derive is the live one — an older errored task must not
 // mask the queued successor (controller finding 2, round 1 — retained).
 func TestDeriveStatusNewestCatalogWins(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil))
 
 	st, err := cl.DeriveStatus(context.Background(), "testid1")
 	require.NoError(t, err)
@@ -378,7 +382,7 @@ func TestDeriveStatusNewestCatalogWins(t *testing.T) {
 // TestDeriveStatusErrorWhenNewestErrored: the error state still surfaces
 // when the newest catalog derive IS the errored one.
 func TestDeriveStatusErrorWhenNewestErrored(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_error_newest.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_error_newest.json", nil))
 
 	st, err := cl.DeriveStatus(context.Background(), "testid1")
 	require.NoError(t, err)
@@ -389,27 +393,27 @@ func TestDeriveStatusErrorWhenNewestErrored(t *testing.T) {
 // task_id across catalog and history otherwise; non-derive tasks (the
 // ingest archive.php) are ignored even when their id is larger.
 func TestNewestDeriveTaskID(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_none.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_none.json", nil))
 	id, err := cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), id, "no derives at all → baseline 0")
 
-	cl = newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil, nil))
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_catalog_old_error.json", nil))
 	id, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), id, "newest across catalog+history (200 > 100)")
 
-	cl = newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil, nil))
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_done.json", nil))
 	id, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.Equal(t, int64(99), id, "history derives count toward the baseline")
 
-	cl = newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil, nil))
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil))
 	id, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.Equal(t, int64(50), id, "only derive tasks count: archive.php id 60 is ignored, derive 50 wins")
 
-	cl = newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil, nil))
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil))
 	_, err = cl.NewestDeriveTaskID(context.Background(), "testid1")
 	require.Error(t, err, "a failed envelope must surface as an error, never a silent baseline 0")
 }
@@ -418,7 +422,7 @@ func TestNewestDeriveTaskID(t *testing.T) {
 // requests too — with the budget shorter than one poll interval the wait
 // ends promptly, far before a full poll cycle would elapse.
 func TestWaitDeriveBudgetBoundsInFlight(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_running.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_running.json", nil))
 
 	start := time.Now()
 	err := WaitDerive(context.Background(), cl, "testid1", 0, 200*time.Millisecond, 30*time.Millisecond)
@@ -432,7 +436,7 @@ func TestWaitDeriveBudgetBoundsInFlight(t *testing.T) {
 // TestWaitDeriveParentCancel: a cancelled parent context ends the wait as
 // an interruption (Ctrl-C semantics), distinct from budget exhaustion.
 func TestWaitDeriveParentCancel(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_running.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_running.json", nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(5*time.Millisecond, cancel)
 
@@ -464,17 +468,17 @@ func TestWaitDeriveTimeoutGuard(t *testing.T) {
 // command (archive.php ingest included); an empty catalog is quiet;
 // an error envelope is an error, never a silent false.
 func TestHasActiveTasks(t *testing.T) {
-	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil, nil))
+	cl := newWebTestClient(t, tasksHandler(t, "tasks_catalog_archivephp.json", nil))
 	active, err := cl.HasActiveTasks(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.True(t, active, "a catalog task of ANY command means the item is busy")
 
-	cl = newWebTestClient(t, tasksHandler(t, "tasks_none.json", nil, nil))
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_none.json", nil))
 	active, err = cl.HasActiveTasks(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.False(t, active, "an empty catalog means no active tasks")
 
-	cl = newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil, nil))
+	cl = newWebTestClient(t, tasksHandler(t, "tasks_envelope_error.json", nil))
 	active, err = cl.HasActiveTasks(context.Background(), "testid1")
 	require.Error(t, err)
 	assert.False(t, active, "an error must not read as a false negative")

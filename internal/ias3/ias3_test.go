@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -176,17 +178,17 @@ func TestMetaValueQuoting(t *testing.T) {
 
 func TestAwaitNotOverLimitErrorCap(t *testing.T) {
 	shrinkPacing(t)
-	puts, checks := 0, 0
+	var puts, checks atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
-			puts++
+			puts.Add(1)
 			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>busy</Message></Error>`))
 			return
 		}
 		if r.URL.Query().Get("check_limit") == "1" {
-			checks++
+			checks.Add(1)
 			// Hard non-200: CheckLimit fails safe to overloaded with an
 			// error, and the httpx ladder passes 403 through instantly
 			// (a 500 would burn seconds of retry-ladder backoff per check).
@@ -202,13 +204,14 @@ func TestAwaitNotOverLimitErrorCap(t *testing.T) {
 
 	require.Error(t, err, "a stably failing check_limit must end the wait, not hang")
 	assert.Contains(t, err.Error(), "проверка лимита очереди стабильно падает")
-	assert.Equal(t, 1, puts, "the upload loop must stop at the broken preflight")
-	assert.Equal(t, maxCheckLimitErrors, checks, "consecutive errored checks must be capped")
+	assert.Equal(t, int64(1), puts.Load(), "the upload loop must stop at the broken preflight")
+	assert.Equal(t, int64(maxCheckLimitErrors), checks.Load(), "consecutive errored checks must be capped")
 }
 
 // --- Upload ---------------------------------------------------------------
 
-type capturedRequest struct {
+// wireRecord is what the fake archive.org server saw for the last request.
+type wireRecord struct {
 	method           string
 	path             string
 	contentMD5       string
@@ -218,26 +221,55 @@ type capturedRequest struct {
 	contentLength    int64
 	transferEncoding []string
 	body             []byte
-	progressLast     int64
+	query            []string
+	cookieHeader     string
+	cookieCount      int
+	identifier       int
+	catalog          int
+	history          int
+	limit            int
+}
+
+// wireRecorder stores the last wireRecord. The httptest handler writes it
+// from its own goroutine while the test reads it from the test goroutine, so
+// an unguarded field would be a data race — every access goes through the
+// mutex, the same discipline the fake servers in internal/runner use.
+type wireRecorder struct {
+	mu   sync.Mutex
+	last wireRecord
+}
+
+// update applies fn to the stored record under the lock.
+func (r *wireRecorder) update(fn func(*wireRecord)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fn(&r.last)
+}
+
+// get returns a copy of the stored record.
+func (r *wireRecorder) get() wireRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last
 }
 
 func TestUploadSuccessWithContentMD5(t *testing.T) {
 	content := "hello"
-	var capReq capturedRequest
-	var progressLast int64
+	rec := &wireRecorder{}
+	var progressLast atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		capReq = capturedRequest{
-			method:           r.Method,
-			path:             r.URL.Path,
-			contentMD5:       r.Header.Get("Content-MD5"),
-			authorization:    r.Header.Get("Authorization"),
-			expect:           r.Header.Get("Expect"),
-			userAgent:        r.Header.Get("User-Agent"),
-			contentLength:    r.ContentLength,
-			transferEncoding: r.TransferEncoding,
-			body:             body,
-		}
+		rec.update(func(cr *wireRecord) {
+			cr.method = r.Method
+			cr.path = r.URL.Path
+			cr.contentMD5 = r.Header.Get("Content-MD5")
+			cr.authorization = r.Header.Get("Authorization")
+			cr.expect = r.Header.Get("Expect")
+			cr.userAgent = r.Header.Get("User-Agent")
+			cr.contentLength = r.ContentLength
+			cr.transferEncoding = r.TransferEncoding
+			cr.body = body
+		})
 		w.WriteHeader(http.StatusOK)
 	})
 	cl, _ := newTestClient(t, h)
@@ -250,29 +282,30 @@ func TestUploadSuccessWithContentMD5(t *testing.T) {
 		Size:       int64(len(content)),
 		MD5Hex:     "5d41402abc4b2a76b9719d911017c592",
 	}, HeaderOpts{Collection: "test_collection", Mediatype: "data"},
-		func(sent int64) { progressLast = sent })
+		func(sent int64) { progressLast.Store(sent) })
 
 	require.NoError(t, err)
-	assert.Equal(t, http.MethodPut, capReq.method)
-	assert.Equal(t, "/testid1/file.bin", capReq.path)
-	assert.Equal(t, "5d41402abc4b2a76b9719d911017c592", capReq.contentMD5, "Content-MD5 must carry the hex digest verbatim")
-	assert.True(t, strings.HasPrefix(capReq.authorization, "LOW AKIAIOSFODNN7EXAMPLE:"), "Authorization must be LOW <access>:<secret>, got %q", capReq.authorization)
-	assert.Equal(t, "100-continue", capReq.expect, "Expect: 100-continue must reach the wire")
-	assert.Contains(t, capReq.userAgent, "wauploader/", "mandatory descriptive User-Agent")
-	assert.Equal(t, int64(len(content)), capReq.contentLength)
-	assert.Equal(t, []byte(content), capReq.body, "server must receive the exact file bytes")
-	assert.Equal(t, int64(len(content)), progressLast, "progress must report the full size")
+	got := rec.get()
+	assert.Equal(t, http.MethodPut, got.method)
+	assert.Equal(t, "/testid1/file.bin", got.path)
+	assert.Equal(t, "5d41402abc4b2a76b9719d911017c592", got.contentMD5, "Content-MD5 must carry the hex digest verbatim")
+	assert.True(t, strings.HasPrefix(got.authorization, "LOW AKIAIOSFODNN7EXAMPLE:"), "Authorization must be LOW <access>:<secret>, got %q", got.authorization)
+	assert.Equal(t, "100-continue", got.expect, "Expect: 100-continue must reach the wire")
+	assert.Contains(t, got.userAgent, "wauploader/", "mandatory descriptive User-Agent")
+	assert.Equal(t, int64(len(content)), got.contentLength)
+	assert.Equal(t, []byte(content), got.body, "server must receive the exact file bytes")
+	assert.Equal(t, int64(len(content)), progressLast.Load(), "progress must report the full size")
 }
 
 func TestUploadSlowDownRetryThenSuccess(t *testing.T) {
 	shrinkPacing(t)
-	puts, checks := 0, 0
+	var puts, checks atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
-			puts++
+			put := puts.Add(1)
 			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
-			if puts == 1 {
+			if put == 1 {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte(`<?xml version="1.0"?><Error><Code>SlowDown</Code><Message>Please slow down.</Message></Error>`))
 				return
@@ -280,7 +313,7 @@ func TestUploadSlowDownRetryThenSuccess(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		default:
 			if r.URL.Query().Get("check_limit") == "1" {
-				checks++
+				checks.Add(1)
 				_, _ = w.Write([]byte(`{"bucket":"testid1","accesskey":"x","over_limit":0,"detail":{}}`))
 			}
 		}
@@ -293,16 +326,16 @@ func TestUploadSlowDownRetryThenSuccess(t *testing.T) {
 	}, HeaderOpts{Mediatype: "data"}, nil)
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, puts, "503 SlowDown must be retried with a whole-file re-PUT")
-	assert.GreaterOrEqual(t, checks, 1, "CheckLimit must run between attempts")
+	assert.Equal(t, int64(2), puts.Load(), "503 SlowDown must be retried with a whole-file re-PUT")
+	assert.GreaterOrEqual(t, checks.Load(), int64(1), "CheckLimit must run between attempts")
 }
 
 func TestUploadSpamSlowDownTerminal(t *testing.T) {
 	shrinkPacing(t)
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
-			puts++
+			puts.Add(1)
 			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>Your file appears to be spam and has been blocked.</Message></Error>`))
@@ -317,15 +350,15 @@ func TestUploadSpamSlowDownTerminal(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrSpamSlowDown), "want ErrSpamSlowDown, got: %v", err)
-	assert.Equal(t, 1, puts, "spam 503 is terminal — must NEVER be retried")
+	assert.Equal(t, int64(1), puts.Load(), "spam 503 is terminal — must NEVER be retried")
 }
 
 func TestUploadBadCredentials(t *testing.T) {
 	shrinkPacing(t)
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
-			puts++
+			puts.Add(1)
 			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist in our records.</Message><Resource /><RequestId>3cb1b592</RequestId></Error>`))
@@ -340,12 +373,12 @@ func TestUploadBadCredentials(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrBadCredentials), "want ErrBadCredentials, got: %v", err)
-	assert.Equal(t, 1, puts, "credentials errors are terminal")
+	assert.Equal(t, int64(1), puts.Load(), "credentials errors are terminal")
 
 	// Also the "bad request" malformed-LOW body form.
-	puts = 0
+	puts.Store(0)
 	h2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		puts++
+		puts.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`bad request`))
@@ -360,15 +393,15 @@ func TestUploadBadCredentials(t *testing.T) {
 
 func TestUpload503InvalidXMLBodyRetryable(t *testing.T) {
 	shrinkPacing(t)
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			_, _ = w.Write([]byte(`{"over_limit":0}`))
 			return
 		}
-		puts++
+		put := puts.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
-		if puts == 1 {
+		if put == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`<html>proxy maintenance page, not xml</html>`))
 			return
@@ -383,19 +416,19 @@ func TestUpload503InvalidXMLBodyRetryable(t *testing.T) {
 	}, HeaderOpts{Mediatype: "data"}, nil)
 
 	require.NoError(t, err, "a 503 with an unparseable body is retryable, not terminal")
-	assert.Equal(t, 2, puts)
+	assert.Equal(t, int64(2), puts.Load())
 }
 
 func TestNoChunkedEncoding(t *testing.T) {
 	content := "content" // 7 bytes
-	var capReq capturedRequest
+	rec := &wireRecorder{}
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		capReq = capturedRequest{
-			transferEncoding: r.TransferEncoding,
-			contentLength:    r.ContentLength,
-			body:             body,
-		}
+		rec.update(func(cr *wireRecord) {
+			cr.transferEncoding = r.TransferEncoding
+			cr.contentLength = r.ContentLength
+			cr.body = body
+		})
 		w.WriteHeader(http.StatusOK)
 	})
 	cl, _ := newTestClient(t, h)
@@ -406,19 +439,22 @@ func TestNoChunkedEncoding(t *testing.T) {
 	}, HeaderOpts{Mediatype: "data"}, nil)
 
 	require.NoError(t, err)
-	assert.Empty(t, capReq.transferEncoding, "Transfer-Encoding: chunked is forbidden by IA-S3 — it must never be set")
-	assert.Equal(t, int64(len(content)), capReq.contentLength, "Content-Length must be set (known length)")
-	assert.Equal(t, content, string(capReq.body))
+	got := rec.get()
+	assert.Empty(t, got.transferEncoding, "Transfer-Encoding: chunked is forbidden by IA-S3 — it must never be set")
+	assert.Equal(t, int64(len(content)), got.contentLength, "Content-Length must be set (known length)")
+	assert.Equal(t, content, string(got.body))
 }
 
 // --- CheckLimit / AwaitNotOverLimit ----------------------------------------
 
 func TestCheckLimitOverLimit(t *testing.T) {
-	var query []string
+	rec := &wireRecorder{}
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("check_limit") == "1" {
 			q := r.URL.Query()
-			query = []string{q.Get("accesskey"), q.Get("bucket")}
+			rec.update(func(cr *wireRecord) {
+				cr.query = []string{q.Get("accesskey"), q.Get("bucket")}
+			})
 			_, _ = w.Write([]byte(`{"bucket":"testid1","accesskey":"AKIAIOSFODNN7EXAMPLE","over_limit":1,"detail":{}}`))
 			return
 		}
@@ -429,7 +465,7 @@ func TestCheckLimitOverLimit(t *testing.T) {
 	over, err := cl.CheckLimit(context.Background(), "testid1")
 	require.NoError(t, err)
 	assert.True(t, over, "over_limit:1 must report the item as overloaded")
-	assert.Equal(t, []string{"AKIAIOSFODNN7EXAMPLE", "testid1"}, query, "query must carry accesskey and bucket")
+	assert.Equal(t, []string{"AKIAIOSFODNN7EXAMPLE", "testid1"}, rec.get().query, "query must carry accesskey and bucket")
 
 	// Free path: over_limit:0 → false.
 	h2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -456,13 +492,13 @@ func TestCheckLimitGarbageIsOverloaded(t *testing.T) {
 
 func TestUpload503BudgetExhausted(t *testing.T) {
 	shrinkPacing(t)
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			_, _ = w.Write([]byte(`{"over_limit":0}`))
 			return
 		}
-		puts++
+		puts.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code><Message>still busy</Message></Error>`))
@@ -475,7 +511,7 @@ func TestUpload503BudgetExhausted(t *testing.T) {
 	}, HeaderOpts{Mediatype: "data"}, nil)
 
 	require.Error(t, err)
-	assert.Equal(t, maxUploadAttempts, puts, "loop budget must cap the number of whole-file PUTs")
+	assert.Equal(t, int64(maxUploadAttempts), puts.Load(), "loop budget must cap the number of whole-file PUTs")
 	var s3Err *S3Error
 	assert.True(t, errors.As(err, &s3Err), "budget exhaustion must surface as a typed S3Error, got: %v", err)
 	assert.Equal(t, http.StatusServiceUnavailable, s3Err.StatusCode)
@@ -485,11 +521,11 @@ func TestUpload503BudgetExhausted(t *testing.T) {
 
 func TestAwaitNotOverLimitPolls(t *testing.T) {
 	shrinkPacing(t)
-	checks := 0
+	var checks atomic.Int64
 	overNow := true
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		checks++
-		if overNow && checks < 3 {
+		n := checks.Add(1)
+		if overNow && n < 3 {
 			_, _ = w.Write([]byte(`{"over_limit":1}`))
 			return
 		}
@@ -499,7 +535,7 @@ func TestAwaitNotOverLimitPolls(t *testing.T) {
 
 	err := AwaitNotOverLimit(context.Background(), cl, "testid1")
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, checks, 3, "must poll until the limit clears")
+	assert.GreaterOrEqual(t, checks.Load(), int64(3), "must poll until the limit clears")
 
 	// Context cancellation must end the loop, not spin forever.
 	h2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -542,9 +578,9 @@ func TestUploadInvalidExtraMetaName(t *testing.T) {
 // --- fix round 1: managed-key guard, accesskey redaction, brackets -------
 
 func TestUploadManagedKeyRejected(t *testing.T) {
-	requests := 0
+	var requests atomic.Int64
 	cl, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+		requests.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -563,7 +599,7 @@ func TestUploadManagedKeyRejected(t *testing.T) {
 		Identifier: "testid1", Key: "testid12_meta.xml", Path: path, Size: 1,
 	}, opts, nil)
 	require.NoError(t, err)
-	assert.Equal(t, 1, requests, "only the near-miss key must reach the wire")
+	assert.Equal(t, int64(1), requests.Load(), "only the near-miss key must reach the wire")
 }
 
 func TestCheckLimitErrorRedactsAccessKey(t *testing.T) {
@@ -587,9 +623,9 @@ func TestCheckLimitErrorRedactsAccessKey(t *testing.T) {
 }
 
 func TestUploadBracketedMetaNameRejected(t *testing.T) {
-	requests := 0
+	var requests atomic.Int64
 	cl, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+		requests.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	path := writeTempFile(t, "x")
@@ -599,14 +635,14 @@ func TestUploadBracketedMetaNameRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "name[0]", "the error must name the offending key")
 	assert.Contains(t, err.Error(), "не поддерживаются S3-заголовками")
-	assert.Equal(t, 0, requests, "must fail fast before any HTTP request")
+	assert.Equal(t, int64(0), requests.Load(), "must fail fast before any HTTP request")
 }
 
 // --- addendum: 429 Too Many Requests retries within the SlowDown budget ---
 
 func TestUpload429RetryThenSuccess(t *testing.T) {
 	shrinkPacing(t)
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			if r.URL.Query().Get("check_limit") == "1" {
@@ -614,9 +650,9 @@ func TestUpload429RetryThenSuccess(t *testing.T) {
 			}
 			return
 		}
-		puts++
+		put := puts.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
-		if puts <= 2 {
+		if put <= 2 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`too many requests, slow down`))
 			return
@@ -631,7 +667,7 @@ func TestUpload429RetryThenSuccess(t *testing.T) {
 	}, HeaderOpts{Mediatype: "data"}, nil)
 
 	require.NoError(t, err)
-	assert.Equal(t, 3, puts, "429 must be retried within the existing budget: 2x429 then success = 3 PUTs")
+	assert.Equal(t, int64(3), puts.Load(), "429 must be retried within the existing budget: 2x429 then success = 3 PUTs")
 }
 
 func TestUpload429HonorsRetryAfter(t *testing.T) {
@@ -639,15 +675,15 @@ func TestUpload429HonorsRetryAfter(t *testing.T) {
 	slowDownWait, retryAfterUnit = 100*time.Millisecond, time.Millisecond
 	t.Cleanup(func() { slowDownWait, retryAfterUnit = oldSleep, oldUnit })
 
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			_, _ = w.Write([]byte(`{"over_limit":0}`))
 			return
 		}
-		puts++
+		put := puts.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
-		if puts == 1 {
+		if put == 1 {
 			w.Header().Set("Retry-After", "3")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`too many requests`))
@@ -665,17 +701,17 @@ func TestUpload429HonorsRetryAfter(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, puts)
+	assert.Equal(t, int64(2), puts.Load())
 	assert.GreaterOrEqual(t, elapsed, 3*time.Millisecond, "the Retry-After delay (3 units) must be honored")
 	assert.Less(t, elapsed, 60*time.Millisecond, "Retry-After must override the 100ms default sleep (ignored Retry-After would sleep 100ms)")
 }
 
 func TestUpload429SpamBodyTerminal(t *testing.T) {
 	shrinkPacing(t)
-	puts := 0
+	var puts atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
-			puts++
+			puts.Add(1)
 			_, _ = io.Copy(io.Discard, r.Body) // avoid 500ms drain in httptest.Server.Close
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -691,5 +727,5 @@ func TestUpload429SpamBodyTerminal(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrSpamSlowDown), "429+spam must be terminal like 503+spam, got: %v", err)
-	assert.Equal(t, 1, puts, "spam body takes precedence over the retry decision — exactly 1 PUT")
+	assert.Equal(t, int64(1), puts.Load(), "spam body takes precedence over the retry decision — exactly 1 PUT")
 }
