@@ -69,7 +69,7 @@ make build          # → ./wauploader (static binary, CGO_ENABLED=0)
 ./wauploader init
 ```
 
-Interactively asks for your archive.org email and password, exchanges them for S3 keys and login cookies through the `xauthn` endpoint, and writes them to `~/.config/wauploader/wauploader.toml` with mode 0600. The password is never persisted — it is not written to the config and never printed. You can paste the S3 keys in by hand instead — they are generated at <https://archive.org/account/s3.php>.
+Interactively asks for your archive.org email and password, exchanges them for S3 keys and login cookies through the `xauthn` endpoint, and writes them to `~/.config/wauploader/wauploader.toml` with mode 0600. The cookies are written only when archive.org returns **both** of them; when it returns the keys without cookies, `init` still succeeds, writes the keys and reports a warning — the keys stay fully usable (IA-S3 uploads, and SPN2 in `auto` or `keys` mode), while cookie-based SPN2 auth (`auth_mode = "cookies"`) is then unavailable. The password is never persisted — it is not written to the config and never printed. You can paste the S3 keys in by hand instead — they are generated at <https://archive.org/account/s3.php>.
 
 ### 3. Save your first pages
 
