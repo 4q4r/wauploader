@@ -63,6 +63,16 @@ make build          # → ./wauploader (static binary, CGO_ENABLED=0)
 ./wauploader version
 ```
 
+### Releases
+
+Prebuilt binaries are published automatically: push a `v*` tag (for example `v0.1.0`) and the CI pipeline builds, verifies and publishes a GitHub Release for it. The release is gated by the whole pipeline — `audit` → `test` → multiarch `build` → `verify` — so a release exists only when every stage was green.
+
+Each release carries the 8 platform binaries (linux, darwin, windows on amd64, arm64, 386 and armv7) and a `SHA256SUMS` checksum file. After downloading the assets, verify them:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
 ### 2. Authenticate
 
 ```sh

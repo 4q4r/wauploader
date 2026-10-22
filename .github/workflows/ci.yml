@@ -1,4 +1,5 @@
-# CI for wauploader — a four-stage pipeline: audit → test → build → verify.
+# CI for wauploader — a five-stage pipeline: audit → test → build → verify →
+# release.
 #
 # Why the stages are split the way they are:
 #   - audit runs FIRST and stays cheap. It fails hard on a broken module
@@ -12,6 +13,9 @@
 #   - verify DOWNLOADS those artifacts and EXECUTES them (-h and -v) on the
 #     runner that matches each target, so a broken binary fails the pipeline
 #     instead of reaching a release.
+#   - release publishes a GitHub Release, but only for a v* tag: the binaries
+#     that were built and verified are attached to it. On every other trigger
+#     the job is skipped, so a push to main never publishes anything.
 #
 # The GitHub-hosted runner images ship only the three latest Go minors
 # (1.24/1.25/1.26), while go.mod requires go 1.27. Therefore every Go job
@@ -20,7 +24,8 @@
 # would resolve to a toolchain the module does not accept.
 #
 # Only official actions are used (actions/*, golangci/*, docker/*), each
-# pinned to a major version. No secrets, no pull_request_target.
+# pinned to a major version. The only credential is the automatic GITHUB_TOKEN,
+# and it is used by the release stage alone. No pull_request_target.
 
 name: CI
 
@@ -28,6 +33,12 @@ on:
   push:
     branches:
       - main
+    # A v* tag runs the whole pipeline (audit → test → build → verify) and
+    # ends in the release stage, which publishes a GitHub Release for the tag.
+    # Both filters are listed, so a push to main and a push of a v* tag each
+    # trigger the workflow on their own.
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -505,3 +516,200 @@ jobs:
             Write-Host "::error::the -v output does not contain the stamped version $expectedVersion"
             exit 1
           }
+
+  # ---------------------------------------------------------------- stage 5
+  release:
+    name: release
+    # The release waits for BOTH matrix jobs. A matrix job is only satisfied
+    # when every one of its legs passed, so nothing is published unless the
+    # whole pipeline is green.
+    needs:
+      - build
+      - verify
+    # Tag pushes only. The job-level `if` names no status-check function, so
+    # GitHub ANDs it with the implicit `success()`: a failed or skipped
+    # dependency keeps the release unpublished. The trigger already limits
+    # the workflow to `v*` tags; this gate states the rule again at the job
+    # that has the side effect.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # The workflow default is `contents: read`; creating a release and
+    # uploading its assets needs write access to the repository contents.
+    # Job-level permissions REPLACE the workflow-level ones, so every other
+    # scope becomes `none` here. That is enough: download-artifact reads the
+    # artifacts of the current run through the run's own runtime token, not
+    # through GITHUB_TOKEN, and the release needs nothing else.
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The tag that triggered this run. `github.ref_name` is the short ref
+      # name, so it is exactly the tag (e.g. v0.1.0). The release job needs
+      # no checkout for it.
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download the build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          # Every artifact of the build stage, each extracted into a
+          # directory named after the artifact. `merge-multiple` is
+          # deliberately NOT set: all eight artifacts contain a file called
+          # `wauploader`, so merging them into one directory would make the
+          # targets overwrite each other.
+          pattern: wauploader-*
+          path: dist
+
+      - name: Stage the release assets
+        run: |
+          set -euo pipefail
+
+          # Each artifact directory holds the binary plus a VERSION marker.
+          # The release assets are the binaries renamed after their target:
+          # the artifact directory is already named `wauploader-<goos>-
+          # <goarch>`, and the binary inside keeps the `.exe` suffix of the
+          # Windows targets. The VERSION file is a CI-internal marker — the
+          # verify stage already asserted the stamped version against it —
+          # so it is not published.
+          #
+          # The binaries of a tag build carry the tag itself as their
+          # version: the build job checks out the tag with `fetch-depth: 0`,
+          # so the tags are fetched and `git describe --tags` resolves to
+          # the tag name (e.g. v0.1.0) rather than to a bare commit id.
+          shopt -s nullglob
+          dirs=(dist/wauploader-*/)
+          if [ "${#dirs[@]}" -ne 8 ]; then
+            echo "::error::expected 8 build artifacts, found ${#dirs[@]}" >&2
+            exit 1
+          fi
+
+          rm -rf release-assets
+          mkdir -p release-assets
+
+          for dir in "${dirs[@]}"; do
+            name="$(basename "$dir")"
+
+            # `find -print | sed -n '1p'` is portable: macOS/BSD find has no
+            # -quit, and sed consumes the whole stream, so there is no
+            # SIGPIPE to trip pipefail.
+            binary="$(find "$dir" -type f \( -name wauploader -o -name wauploader.exe \) -print 2>/dev/null | sed -n '1p' || true)"
+            if [ -z "$binary" ]; then
+              echo "::error::no binary found in $dir" >&2
+              find "$dir" -type f >&2 || true
+              exit 1
+            fi
+            case "$binary" in
+              *.exe) target="$name.exe" ;;
+              *) target="$name" ;;
+            esac
+            cp "$binary" "release-assets/$target"
+
+            # The VERSION file records the version the build stamped into
+            # the binary. On a tag build it is the tag itself, so the
+            # assets of this release report the very version they are
+            # released under.
+            version_file="$(find "$dir" -type f -name VERSION -print 2>/dev/null | sed -n '1p' || true)"
+            if [ -n "$version_file" ]; then
+              version="$(tr -d '[:space:]' < "$version_file")"
+              if [ "$version" != "$TAG" ]; then
+                echo "::error::$name reports version $version, but the release is tagged $TAG" >&2
+                exit 1
+              fi
+            else
+              echo "::warning::$name carries no VERSION file; the stamped version was not cross-checked"
+            fi
+          done
+
+          ls -l release-assets
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+
+          # The checksum file sits next to the binaries it covers, so a user
+          # can verify a download with `sha256sum -c SHA256SUMS` in the
+          # directory holding the release assets. `rm -f` first and `--`
+          # before the glob: the file must not list itself, and the `--`
+          # keeps a name that starts with a dash from being read as an
+          # option.
+          cd release-assets
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Check that the release does not exist yet
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # `gh release create` refuses to overwrite a published release on
+          # its own, but it does so only after it has already created a
+          # draft and uploaded the assets. Checking first turns a re-run of
+          # the same tag into a clear, early failure.
+          if view_output="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1)"; then
+            echo "::error::a release for $TAG already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          case "$view_output" in
+            *"release not found"*) echo "No release for $TAG yet." ;;
+            *)
+              echo "::error::could not check whether a release for $TAG exists: $view_output" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Create the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A quoted heredoc keeps the backticks of the markdown literal:
+          # inside single quotes they would be a command substitution, and
+          # inside double quotes a `$(...)` in the text would expand.
+          notes=$(cat <<'NOTES'
+          This release ships 8 prebuilt binaries (linux, darwin, windows on amd64, arm64, 386 and armv7) plus a `SHA256SUMS` checksum file. Verify a download with `sha256sum -c SHA256SUMS`.
+          NOTES
+          )
+
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [ "${#assets[@]}" -ne 9 ]; then
+            echo "::error::expected 9 release assets (8 binaries + SHA256SUMS), found ${#assets[@]}" >&2
+            exit 1
+          fi
+
+          # `--notes` and `--generate-notes` together: the GitHub API
+          # prepends the body given with `--notes` to the notes it generates,
+          # so the release body opens with the description of the assets and
+          # continues with the generated changelog. `--title` is passed
+          # explicitly, so the release is titled after the tag instead of the
+          # generated one.
+          #
+          # `--verify-tag` aborts unless the tag already exists in the
+          # repository: without it `gh` would create the tag from the
+          # default branch and publish a release for the wrong commit.
+          #
+          # Known GitHub limitation, not a bug here: creating a release
+          # with GITHUB_TOKEN fails with 404 when the tagged commit changes
+          # a file under .github/workflows/ relative to the default branch
+          # (GITHUB_TOKEN cannot be granted the workflow scope). Tagging
+          # the tip of main — the normal case — is unaffected, because the
+          # workflow file is then identical on both refs. The step fails
+          # loudly in that case, so nothing is published.
+          gh release create "$TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "$notes" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Print the release URL
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url
