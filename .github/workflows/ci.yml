@@ -256,7 +256,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          # The version of a tag build is the TRIGGERING tag, not whatever
+          # `git describe` happens to pick. A commit can carry more than one
+          # tag, and `describe --tags` prefers an annotated tag over a
+          # lightweight one: with an annotated `v0.1.0` AND the lightweight
+          # `v0.2.0` that triggered the run on the same commit, `describe`
+          # reports `v0.1.0`. The release stage would then reject every
+          # artifact as a version mismatch and publish nothing, while build
+          # and verify stayed green.
+          #
+          # `$GITHUB_REF` is the default environment variable and holds
+          # exactly the `github.ref` context value: `refs/tags/<tag>` for a
+          # tag build, `refs/heads/<branch>` or `refs/pull/<n>/merge`
+          # otherwise. The `refs/tags/v*` pattern is the same test the
+          # release stage gates on, so the version that is stamped here and
+          # the version the release stage expects cannot drift apart.
+          # Branch and PR builds keep the describe behaviour, including its
+          # `-dirty` suffix.
+          #
+          # `git describe` needs the tags, which the `fetch-depth: 0`
+          # checkout above fetches.
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF#refs/tags/}" ;;
+            *) version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)" ;;
+          esac
+
           exe="wauploader"
           if [ "$GOOS" = "windows" ]; then
             exe="wauploader.exe"
@@ -607,9 +631,12 @@ jobs:
             cp "$binary" "release-assets/$target"
 
             # The VERSION file records the version the build stamped into
-            # the binary. On a tag build it is the tag itself, so the
-            # assets of this release report the very version they are
-            # released under.
+            # the binary. On a tag build the build stage stamps the
+            # TRIGGERING tag, so the assets of this release report the very
+            # version they are released under. The comparison is a
+            # validation of that invariant, not the mechanism that produces
+            # it: a mismatch means the build and the release disagree about
+            # the version, and publishing would be wrong.
             version_file="$(find "$dir" -type f -name VERSION -print 2>/dev/null | sed -n '1p' || true)"
             if [ -n "$version_file" ]; then
               version="$(tr -d '[:space:]' < "$version_file")"

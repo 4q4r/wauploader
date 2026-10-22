@@ -67,7 +67,20 @@ make build          # → ./wauploader (static binary, CGO_ENABLED=0)
 
 Prebuilt binaries are published automatically: push a `v*` tag (for example `v0.1.0`) and the CI pipeline builds, verifies and publishes a GitHub Release for it. The release is gated by the whole pipeline — `audit` → `test` → multiarch `build` → `verify` — so a release exists only when every stage was green.
 
-Each release carries the 8 platform binaries (linux, darwin, windows on amd64, arm64, 386 and armv7) and a `SHA256SUMS` checksum file. After downloading the assets, verify them:
+Each release carries the 8 platform binaries and a `SHA256SUMS` checksum file:
+
+| Asset | Platform |
+| :-- | :-- |
+| `wauploader-linux-amd64` | Linux x86-64 |
+| `wauploader-linux-arm64` | Linux arm64 |
+| `wauploader-linux-386` | Linux x86 (32-bit) |
+| `wauploader-linux-arm` | Linux armv7 |
+| `wauploader-darwin-amd64` | macOS x86-64 |
+| `wauploader-darwin-arm64` | macOS arm64 (Apple silicon) |
+| `wauploader-windows-amd64.exe` | Windows x86-64 |
+| `wauploader-windows-arm64.exe` | Windows arm64 |
+
+Download the assets into one directory and verify them:
 
 ```sh
 sha256sum -c SHA256SUMS
