@@ -161,6 +161,9 @@ Fail-fast rules — the first violated one is reported and the run stops:
 
 Every command and subcommand answers to `-h` / `--help`.
 
+The root command also answers to `-v` / `--version`: it prints the build version as one
+line (`wauploader version <version>`) — the same line the `version` subcommand prints.
+
 ### `wauploader save URL... | --list FILE`
 
 | Flag | Description |
@@ -328,7 +331,7 @@ filter). The listing is a human surface — `--json` does not apply to it.
 ### `wauploader init` · `wauploader version`
 
 Interactive login with email + password that writes the keys into the config; the
-build version.
+build version. The version is also available as `wauploader -v` / `wauploader --version`.
 
 ---
 

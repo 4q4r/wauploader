@@ -355,8 +355,15 @@ func usageMaximumNArgs(n int) cobra.PositionalArgs {
 // usage error (exit 2).
 func NewRootCommand(configPath, journalPath *string, jsonOut, noColor, dryRun *bool) *cobra.Command {
 	root := &cobra.Command{
-		Use:           version.Name,
-		Short:         "Сохранение страниц в web.archive.org и загрузка файлов в элементы archive.org",
+		Use:   version.Name,
+		Short: "Сохранение страниц в web.archive.org и загрузка файлов в элементы archive.org",
+		// Version makes cobra register its own version flag: InitDefaultVersionFlag
+		// adds --version plus the -v shorthand (the root has no "v" flag of its
+		// own, so the shorthand is free). The printed line is cobra's default
+		// template — "<name> version <version>" — byte-identical to the
+		// `version` subcommand output, so both surfaces can be grepped the same
+		// way (the CI workflow asserts on it).
+		Version:       version.Version,
 		SilenceUsage:  true, // Russian guidance replaces the usage dump
 		SilenceErrors: true, // errors print through the console in Russian (main)
 		CompletionOptions: cobra.CompletionOptions{
