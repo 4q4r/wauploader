@@ -1,0 +1,434 @@
+# CI for wauploader — a four-stage pipeline: audit → test → build → verify.
+#
+# Why the stages are split the way they are:
+#   - audit runs FIRST and stays cheap. It fails hard on a broken module
+#     state (go mod verify, go mod tidy -diff) and on known vulnerabilities,
+#     but an outdated dependency is only a WARNING: a fresh minor bump must
+#     never block master.
+#   - test runs the repository's own gate as separate steps (gofmt → vet →
+#     lint → tests) so a red job names the stage that broke.
+#   - build cross-compiles every release target on ONE runner and uploads the
+#     binaries as artifacts.
+#   - verify DOWNLOADS those artifacts and EXECUTES them (-h and -v) on the
+#     runner that matches each target, so a broken binary fails the pipeline
+#     instead of reaching a release.
+#
+# The GitHub-hosted runner images ship only the three latest Go minors
+# (1.24/1.25/1.26), while go.mod requires go 1.27. Therefore every Go job
+# uses actions/setup-go with `go-version-file: go.mod`: it reads the `go`
+# directive and resolves the latest 1.27.x patch. A hardcoded `go-version:`
+# would resolve to a toolchain the module does not accept.
+#
+# Only official actions are used (actions/*, golangci/*, docker/*), each
+# pinned to a major version. No secrets, no pull_request_target.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per ref. A new push to a pull request cancels the previous run;
+  # runs on main are queued instead of cancelled so no build is ever lost.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------- stage 1
+  audit:
+    name: audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Report the toolchain in use
+        run: |
+          {
+            echo "## Toolchain"
+            echo ""
+            echo '```'
+            go version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          go version
+
+      - name: Verify the module cache
+        # Fails when a module in go.sum does not match the downloaded content.
+        run: go mod verify
+
+      - name: Check that go.mod and go.sum are tidy
+        # `go mod tidy -diff` prints the diff it would apply and exits
+        # non-zero when the diff is not empty (Go 1.23+). The files are never
+        # modified by the check itself.
+        run: go mod tidy -diff
+
+      - name: Install govulncheck
+        # Pinned exactly as docs/lint.md documents it. The binary must be
+        # built with the same Go major/minor as the module (docs/lint.md).
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Vulnerability scan
+        run: govulncheck ./...
+
+      - name: Dependency currency report
+        # Outdated modules are reported, never enforced: a direct dependency
+        # that is one minor behind must not block master.
+        run: |
+          set -uo pipefail
+
+          main_module="$(go list -m -f '{{.Path}}')"
+          updates_file="$(mktemp)"
+          errors_file="$(mktemp)"
+
+          if ! go list -u -m -f '{{if .Update}}{{.Path}}|{{.Version}}|{{.Update.Version}}|{{if .Indirect}}no{{else}}yes{{end}}{{end}}' all > "$updates_file" 2> "$errors_file"; then
+            echo "::warning::could not query the module proxy for updates; the currency report is skipped"
+            cat "$errors_file"
+            exit 0
+          fi
+
+          {
+            echo "## Dependency currency"
+            echo ""
+            echo "| Module | Current | Latest | Direct |"
+            echo "| :-- | :-- | :-- | :-- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          direct_outdated=0
+          while IFS='|' read -r path current latest direct; do
+            [ -n "$path" ] || continue
+            [ "$path" = "$main_module" ] && continue
+            echo "| \`$path\` | $current | $latest | $direct |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$direct" = "yes" ]; then
+              direct_outdated=$((direct_outdated + 1))
+              echo "::warning title=Outdated direct dependency::$path $current -> $latest"
+            fi
+          done < "$updates_file"
+
+          {
+            echo ""
+            if [ "$direct_outdated" -gt 0 ]; then
+              echo "Outdated direct dependencies: $direct_outdated. Reported as a warning only — a fresh minor bump must not block master."
+            else
+              echo "Every direct dependency is up to date."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Outdated direct dependencies: $direct_outdated"
+
+  # ---------------------------------------------------------------- stage 2
+  test:
+    name: test (${{ matrix.runner }})
+    needs: audit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The race detector must be green on arm64 as well, so the suite runs
+        # on a native arm64 runner (ubuntu-24.04-arm) next to the x64 one.
+        # Both run the repository's own `make test` target unchanged.
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Formatting gate (make check)
+        run: make check
+
+      - name: Vet (make vet)
+        run: make vet
+
+      - name: Lint (make lint)
+        # This action replaces the `make lint` target: it runs the very same
+        # `golangci-lint run` in the repository root (the same .golangci.yml),
+        # but it also pins the linter binary to the version docs/lint.md
+        # requires (v2.14.0). The binary↔toolchain pairing landmine from
+        # docs/lint.md is the reason the version is pinned here.
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          args: --timeout=5m
+
+      - name: Tests (make test)
+        run: make test
+
+  # ---------------------------------------------------------------- stage 3
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    # One runner cross-compiles every target: Go cross-compiles without a C
+    # toolchain as long as CGO is off, and this keeps the matrix cheap.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: "386"
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # `git describe --tags` needs the tags, so the history is fetched
+          # completely; a shallow clone would stamp a bare SHA instead.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+
+          version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          exe="wauploader"
+          if [ "$GOOS" = "windows" ]; then
+            exe="wauploader.exe"
+          fi
+
+          out="dist/${GOOS}-${GOARCH}/${exe}"
+          mkdir -p "dist/${GOOS}-${GOARCH}"
+          echo "Building ${out} (version ${version})"
+
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/4q4r/wauploader/internal/version.Version=${version}" \
+            -o "$out" .
+
+          ls -l "$out"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: wauploader-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/wauploader${{ matrix.goos == 'windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 7
+          # Binaries are already compressed-ish; skip the extra CPU cost.
+          compression-level: 0
+
+  # ---------------------------------------------------------------- stage 4
+  verify:
+    name: verify ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+          - goos: linux
+            goarch: "386"
+            # A static Go 386 binary runs on x86_64 through the kernel's ia32
+            # support — no 32-bit runtime libraries are needed.
+            runner: ubuntu-24.04
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            runner: ubuntu-24.04
+            # armv7 has no native runner: QEMU emulates it on the x64 runner.
+            qemu: true
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+          - goos: windows
+            goarch: arm64
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download the binary
+        uses: actions/download-artifact@v8
+        with:
+          name: wauploader-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist
+
+      - name: Set up QEMU for the armv7 target
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Check -h and -v (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+
+          bin="dist/wauploader"
+          if [ ! -x "$bin" ]; then
+            bin="$(find dist -type f -name wauploader -print -quit)"
+          fi
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "::error::the wauploader binary was not found under dist/"
+            find dist -type f || true
+            exit 1
+          fi
+          echo "Binary under test: $bin"
+
+          if help_out="$("$bin" -h 2>&1)"; then
+            help_code=0
+          else
+            help_code=$?
+          fi
+          echo "--- wauploader -h (exit $help_code) ---"
+          echo "$help_out"
+          if [ "$help_code" -ne 0 ]; then
+            echo "::error::wauploader -h exited with $help_code"
+            exit 1
+          fi
+          if [ -z "$help_out" ]; then
+            echo "::error::wauploader -h printed nothing"
+            exit 1
+          fi
+          case "$help_out" in
+            *wauploader*) ;;
+            *)
+              echo "::error::the -h output does not mention wauploader"
+              exit 1
+              ;;
+          esac
+
+          if ver_out="$("$bin" -v 2>&1)"; then
+            ver_code=0
+          else
+            ver_code=$?
+          fi
+          echo "--- wauploader -v (exit $ver_code) ---"
+          echo "$ver_out"
+          if [ "$ver_code" -ne 0 ]; then
+            echo "::error::wauploader -v exited with $ver_code"
+            exit 1
+          fi
+          if [ -z "$ver_out" ]; then
+            echo "::error::wauploader -v printed nothing"
+            exit 1
+          fi
+          case "$ver_out" in
+            *wauploader*) ;;
+            *)
+              echo "::error::the -v output does not mention wauploader"
+              exit 1
+              ;;
+          esac
+          case "$ver_out" in
+            *version*) ;;
+            *)
+              echo "::error::the -v output is not a version line"
+              exit 1
+              ;;
+          esac
+
+      - name: Check -h and -v (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $binary = Get-ChildItem -Path dist -Recurse -Filter 'wauploader.exe' -File |
+            Select-Object -First 1
+          if (-not $binary) {
+            Write-Host "::error::the wauploader binary was not found under dist/"
+            exit 1
+          }
+          $path = $binary.FullName
+          Write-Host "Binary under test: $path"
+
+          $helpOut = (& $path -h | Out-String)
+          $helpCode = $LASTEXITCODE
+          Write-Host "--- wauploader -h (exit $helpCode) ---"
+          Write-Host $helpOut
+          if ($helpCode -ne 0) {
+            Write-Host "::error::wauploader -h exited with $helpCode"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($helpOut)) {
+            Write-Host "::error::wauploader -h printed nothing"
+            exit 1
+          }
+          if ($helpOut -notmatch 'wauploader') {
+            Write-Host "::error::the -h output does not mention wauploader"
+            exit 1
+          }
+
+          $verOut = (& $path -v | Out-String)
+          $verCode = $LASTEXITCODE
+          Write-Host "--- wauploader -v (exit $verCode) ---"
+          Write-Host $verOut
+          if ($verCode -ne 0) {
+            Write-Host "::error::wauploader -v exited with $verCode"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($verOut)) {
+            Write-Host "::error::wauploader -v printed nothing"
+            exit 1
+          }
+          if ($verOut -notmatch 'wauploader') {
+            Write-Host "::error::the -v output does not mention wauploader"
+            exit 1
+          }
+          if ($verOut -notmatch 'version') {
+            Write-Host "::error::the -v output is not a version line"
+            exit 1
+          }
