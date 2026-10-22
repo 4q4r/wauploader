@@ -69,6 +69,21 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           go version
 
+      - name: Download the modules
+        # `go mod verify` only checks the modules that are already extracted in
+        # the module cache — it never downloads anything. setup-go saves its
+        # cache in the post step, so on a cold cache the check would pass over
+        # an empty cache and prove nothing. Downloading first makes the check
+        # unconditional.
+        #
+        # Not `all`: `go mod download all` records the h1: hashes of the
+        # test-only dependencies of the dependencies in go.sum, and the
+        # `go mod tidy -diff` gate below would then fail on the extra lines.
+        # Without `all` the go command downloads the modules the build needs —
+        # the ones whose content go.sum can actually verify — and leaves
+        # go.sum untouched.
+        run: go mod download
+
       - name: Verify the module cache
         # Fails when a module in go.sum does not match the downloaded content.
         run: go mod verify
@@ -165,7 +180,7 @@ jobs:
       - name: Vet (make vet)
         run: make vet
 
-      - name: Lint (make lint)
+      - name: Lint (golangci-lint v2.14.0)
         # This action replaces the `make lint` target: it runs the very same
         # `golangci-lint run` in the repository root (the same .golangci.yml),
         # but it also pins the linter binary to the version docs/lint.md
@@ -244,13 +259,21 @@ jobs:
             -ldflags "-s -w -X github.com/4q4r/wauploader/internal/version.Version=${version}" \
             -o "$out" .
 
-          ls -l "$out"
+          # Publish the version that was stamped into the binary next to it, so
+          # the verify stage can assert that `-v` prints exactly this string
+          # (a wrong -X path would otherwise slip through).
+          printf '%s\n' "$version" > "dist/${GOOS}-${GOARCH}/VERSION"
+
+          ls -l "dist/${GOOS}-${GOARCH}"
 
       - name: Upload the binary
         uses: actions/upload-artifact@v7
         with:
           name: wauploader-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/wauploader${{ matrix.goos == 'windows' && '.exe' || '' }}
+          # The whole target directory: the binary and the VERSION file that
+          # carries the stamped version. upload-artifact uses that directory as
+          # the artifact root, so both land at the top of the artifact.
+          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/
           if-no-files-found: error
           retention-days: 7
           # Binaries are already compressed-ish; skip the extra CPU cost.
@@ -317,15 +340,37 @@ jobs:
           set -euo pipefail
 
           bin="dist/wauploader"
-          if [ ! -x "$bin" ]; then
-            bin="$(find dist -type f -name wauploader -print -quit)"
+          if [ ! -f "$bin" ]; then
+            # `find -print | sed -n '1p'` is portable: macOS/BSD find has no
+            # -quit, and sed consumes the whole stream, so there is no SIGPIPE
+            # to trip pipefail.
+            bin="$(find dist -type f -name wauploader -print 2>/dev/null | sed -n '1p' || true)"
           fi
-          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+          if [ -z "$bin" ] || [ ! -f "$bin" ]; then
             echo "::error::the wauploader binary was not found under dist/"
             find dist -type f || true
             exit 1
           fi
+          # download-artifact extracts the artifact files as 0644: unzip-stream
+          # parses the zip's Unix mode but never applies it, so the executable
+          # bit of the built binary is lost on the way out of the artifact.
+          chmod +x "$bin"
           echo "Binary under test: $bin"
+
+          # The build stage publishes the version it stamped into the binary
+          # next to it. The file sits either at the artifact root or next to
+          # the binary, depending on the layout the artifact was created with.
+          expected_version=""
+          for candidate in "dist/VERSION" "$(dirname "$bin")/VERSION"; do
+            if [ -f "$candidate" ]; then
+              expected_version="$(tr -d '[:space:]' < "$candidate")"
+              echo "Expected version (from $candidate): $expected_version"
+              break
+            fi
+          done
+          if [ -z "$expected_version" ]; then
+            echo "::warning::the artifact carries no VERSION file; the -v check falls back to the weaker assertion"
+          fi
 
           if help_out="$("$bin" -h 2>&1)"; then
             help_code=0
@@ -379,6 +424,15 @@ jobs:
               exit 1
               ;;
           esac
+          if [ -n "$expected_version" ]; then
+            case "$ver_out" in
+              *"$expected_version"*) ;;
+              *)
+                echo "::error::the -v output does not contain the stamped version $expected_version"
+                exit 1
+                ;;
+            esac
+          fi
 
       - name: Check -h and -v (Windows)
         if: runner.os == 'Windows'
@@ -394,6 +448,21 @@ jobs:
           }
           $path = $binary.FullName
           Write-Host "Binary under test: $path"
+
+          # The build stage publishes the version it stamped into the binary
+          # next to it. The file sits either at the artifact root or next to
+          # the binary, depending on the layout the artifact was created with.
+          $expectedVersion = ''
+          foreach ($candidate in @('dist/VERSION', (Join-Path $binary.DirectoryName 'VERSION'))) {
+            if (Test-Path -LiteralPath $candidate) {
+              $expectedVersion = (Get-Content -LiteralPath $candidate -Raw).Trim()
+              Write-Host "Expected version (from $candidate): $expectedVersion"
+              break
+            }
+          }
+          if (-not $expectedVersion) {
+            Write-Host "::warning::the artifact carries no VERSION file; the -v check falls back to the weaker assertion"
+          }
 
           $helpOut = (& $path -h | Out-String)
           $helpCode = $LASTEXITCODE
@@ -430,5 +499,9 @@ jobs:
           }
           if ($verOut -notmatch 'version') {
             Write-Host "::error::the -v output is not a version line"
+            exit 1
+          }
+          if ($expectedVersion -and $verOut -notmatch [regex]::Escape($expectedVersion)) {
+            Write-Host "::error::the -v output does not contain the stamped version $expectedVersion"
             exit 1
           }
